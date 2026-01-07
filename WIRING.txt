@@ -1,0 +1,115 @@
+================================================================================
+        WIRING DIAGRAM: Raspberry Pi Pico ↔ RA-02 (SX1276)
+================================================================================
+
+POWER SUPPLY:
+⚠️  RA-02 module operates at 3.3V ONLY! Do NOT connect to 5V!
+    Use 3V3 output from Pico (Pin 36)
+
+================================================================================
+PIN CONNECTIONS TABLE
+================================================================================
+
+RA-02 Module        Name        Pi Pico         Pi Pico
+   Pin                           GPIO             Pin
+--------------------------------------------------------------
+    1              GND          GND             Pin 38
+    2              MISO         GPIO 12         Pin 16
+    3              MOSI         GPIO 11         Pin 15
+    4              SCK          GPIO 10         Pin 14
+    5              NSS          GPIO 13         Pin 17
+    6              RESET        GPIO 14         Pin 19
+    7              DIO0         GPIO 15         Pin 20
+    8              VCC          3V3             Pin 36
+
+================================================================================
+FACTORY RESET JUMPER
+================================================================================
+
+GP5 (Pin 7) ──────── GND (when jumper installed = format flash)
+
+To reset flash filesystem:
+1. Install jumper between GP5 and GND
+2. Connect Pico to USB
+3. Wait for format complete
+4. Remove jumper and reset
+
+================================================================================
+VISUAL DIAGRAM
+================================================================================
+
+
+        RA-02 Module                     Raspberry Pi Pico
+       ┌───────────┐                    ┌──────────────────┐
+       │           │                    │                  │
+   1   │    GND    │◄───────────────────┤ GND     (Pin 38) │
+   2   │   MISO    │───────────────────►│ GPIO12  (Pin 16) │
+   3   │   MOSI    │◄───────────────────┤ GPIO11  (Pin 15) │
+   4   │    SCK    │◄───────────────────┤ GPIO10  (Pin 14) │
+       │           │                    │                  │
+   5   │    NSS    │◄───────────────────┤ GPIO13  (Pin 17) │
+   6   │   RESET   │◄───────────────────┤ GPIO14  (Pin 19) │
+   7   │   DIO0    │───────────────────►│ GPIO15  (Pin 20) │
+       │           │                    │                  │
+   8   │    VCC    │◄───────────────────┤ 3V3     (Pin 36) │
+       │           │                    │                  │
+       │    ANT    │────► Wire Antenna  │                  │
+       │           │                    │                  │
+       └───────────┘                    │                  │
+                                        │ GPIO5   (Pin 7)  │──┐
+                                        │                  │  │ Jumper
+                                        │ GND     (Pin 8)  │──┘ (reset)
+                                        │                  │
+                                        │ USB              │──► Computer
+                                        └──────────────────┘
+
+================================================================================
+RA-02 MODULE PINOUT (TOP VIEW)
+================================================================================
+
+           ┌─────────────────┐
+           │    RA-02        │
+           │    SX1276       │
+           │                 │
+    ANT ───┤■                │
+           │                 │
+           │  1  2  3  4     │
+           │  ○  ○  ○  ○     │
+           │                 │
+           │  5  6  7  8     │
+           │  ○  ○  ○  ○     │
+           └─────────────────┘
+
+    Pin 1: GND
+    Pin 2: MISO (SPI Data Out)
+    Pin 3: MOSI (SPI Data In)
+    Pin 4: SCK  (SPI Clock)
+    Pin 5: NSS  (Chip Select, active low)
+    Pin 6: RESET (active low)
+    Pin 7: DIO0 (TX Done interrupt)
+    Pin 8: VCC  (3.3V power)
+
+================================================================================
+ANTENNA
+================================================================================
+
+For 70cm band (433 MHz):
+    1/4 wave = 300 / 433 / 4 ≈ 17.3 cm wire
+
+For 2m band (144 MHz):
+    1/4 wave = 300 / 144 / 4 ≈ 52 cm wire
+
+Note: RA-02 is optimized for 433 MHz. For 144 MHz, use appropriate
+      SX1276/SX1278 module designed for that frequency range.
+
+================================================================================
+NOTES
+================================================================================
+
+1. SPI1 is used (not SPI0)
+2. All active-low signals (NSS, RESET) are directly connected
+3. DIO0 is used for TX Done interrupt detection
+4. GPIO5 is for factory reset jumper - connect to GND at boot to format flash
+5. USB provides power and acts as Mass Storage Device for image upload
+
+================================================================================
