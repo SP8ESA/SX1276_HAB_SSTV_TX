@@ -60,6 +60,8 @@ target_link_libraries(SX1276_HAB_SSTV_TX
         hardware_dma
         hardware_flash
         hardware_sync
+        hardware_adc
+        hardware_uart
         tinyusb_device
         tinyusb_board)
 

@@ -14,6 +14,7 @@ SSTV (Slow Scan Television) image transmitter for stratospheric balloon missions
 - **JPEG Support** - Automatic JPEG decoding
 - **Multiple Images** - Cycles through all JPEG files alphabetically
 - **Two SSTV Modes** - Robot36 (36s) and PD120 (126s)
+- **Horus v2 Telemetry** - 4FSK telemetry between SSTV images
 - **Configuration File** - Easy setup via config.txt
 - **PPM Correction** - Precise frequency tuning for crystal offset
 - **Auto-recovery** - GP5 jumper for factory reset
@@ -121,6 +122,9 @@ freq=434.500
 ppm=0.0
 interval=3
 mode=robot36
+horus=0
+horus_id=256
+horus_count=1
 ```
 
 | Parameter | Description | Default |
@@ -129,6 +133,28 @@ mode=robot36
 | `ppm` | Crystal PPM correction | 0.0 |
 | `interval` | Seconds between transmissions | 3 |
 | `mode` | SSTV mode: `robot36` or `pd120` | robot36 |
+| `horus` | Enable Horus v2 telemetry: `0` or `1` | 0 |
+| `horus_id` | Horus payload ID (256-65535 for custom) | 256 |
+| `horus_count` | Number of Horus packets per SSTV cycle | 1 |
+
+### Horus Binary v2 Telemetry
+
+The transmitter supports **Horus Binary v2** 4FSK telemetry. When enabled, telemetry packets are transmitted before each SSTV image.
+
+**Horus v2 Specifications:**
+- 100 baud 4FSK
+- Golay FEC for error correction
+- Standard Horus audio frequencies (1200-2010 Hz)
+- Compatible with [Horus-GUI](https://github.com/projecthorus/horus-gui) decoder
+
+**Packet Contents:**
+- Payload ID and packet counter
+- Time (hours, minutes, seconds)
+- Position (latitude, longitude, altitude)
+- Speed and satellite count
+- Temperature and battery voltage
+
+**Note:** Currently sends simulated test data. To use real GPS/sensor data, modify the `horus_update_telemetry()` function with actual readings.
 
 ### SSTV Modes
 

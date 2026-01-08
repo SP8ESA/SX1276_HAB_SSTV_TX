@@ -1,14 +1,27 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
+#include "hardware/adc.h"
+#include "hardware/uart.h"
 #include "tusb.h"
 #include "msc_disk.h"
 
 // JPEG loader implemented in jpeg_tjpgdec.c
 bool load_jpeg_image(const uint8_t* jpeg_data, uint32_t size);
+
+// Forward declarations for radio functions (used by Horus before definition)
+void tone(uint32_t freq_hz);
+void tone_off(void);
+void tone_ms(uint32_t freq_hz, uint32_t ms);
+void tone_us(uint32_t freq_hz, uint32_t us);
+void feed_fifo(void);
+void sx_write(uint8_t reg, uint8_t val);
+uint8_t sx_read(uint8_t reg);
+void set_bitrate(uint32_t br);
 
 #define PIN_SCK   10
 #define PIN_MOSI  11
@@ -16,6 +29,16 @@ bool load_jpeg_image(const uint8_t* jpeg_data, uint32_t size);
 #define PIN_CS    13
 #define PIN_RST   14
 #define PIN_DIO0  15
+#define PIN_DIO2  16    // Data input for continuous FSK mode
+
+// GPS ATGM336H pins
+#define GPS_UART       uart0
+#define GPS_UART_RX    1        // GP1 - GPS TX -> Pico RX
+#define GPS_GND_PIN1   2        // GP2 - GPS GND control
+#define GPS_GND_PIN2   3        // GP3 - GPS GND control  
+#define GPS_GND_PIN3   4        // GP4 - GPS GND control
+#define GPS_BAUD       9600
+
 
 // SX1276 Registers
 #define REG_FIFO           0x00
@@ -62,6 +85,22 @@ typedef enum {
     SSTV_PD120 = 1
 } sstv_mode_t;
 static sstv_mode_t sstv_mode = SSTV_ROBOT36;
+
+// ============================================================================
+// HORUS BINARY v2 - 4FSK Telemetry (TRUE RF 4FSK, not AFSK)
+// ============================================================================
+// 100 baud, 4FSK, 270 Hz shift between tones
+// Direct frequency shifting for SDR reception
+
+#define HORUS_BAUD_RATE    100      // 100 symbols/sec
+#define HORUS_TONE_SPACING 270      // Hz between tones (standard Horus)
+#define HORUS_SYMBOL_US    10000    // 1/100 baud = 10ms per symbol
+
+// Horus v2 configuration
+static bool horus_enabled = false;
+static uint16_t horus_payload_id = 256;  // 256+ for custom payloads
+static uint32_t horus_packet_count = 0;
+static uint32_t horus_tx_count = 1;      // How many packets per interval
 
 // FM deviation - try lower for cleaner signal
 // Standard SSTV is ±2.4 kHz but let's try ±1.5 kHz
@@ -193,7 +232,831 @@ void generate_test_image(void) {
     printf("Done.\n");
 }
 
+// ============================================================================
+// HORUS BINARY v2 IMPLEMENTATION
+// Based on horus_l2.c by David Rowe VK5DGR
+// https://github.com/projecthorus/horusdemodlib/blob/master/src/horus_l2.c
+// ============================================================================
+
+// ============================================================================
+// VSYS voltage measurement using ADC
+// Pi Pico has VSYS connected to ADC3 (GPIO29) through 3:1 voltage divider
+// ============================================================================
+static bool adc_initialized = false;
+
+static void init_vsys_adc(void) {
+    if (!adc_initialized) {
+        adc_init();
+        adc_gpio_init(29);  // GPIO29 = ADC3 = VSYS/3
+        adc_initialized = true;
+    }
+}
+
+// Read VSYS voltage in volts (returns value like 3.7, 4.2, 5.0)
+static float read_vsys_voltage(void) {
+    init_vsys_adc();
+    adc_select_input(3);  // ADC3 = VSYS/3
+    
+    // Average multiple readings for stability
+    uint32_t sum = 0;
+    for (int i = 0; i < 16; i++) {
+        sum += adc_read();
+    }
+    uint16_t adc_raw = sum / 16;
+    
+    // ADC is 12-bit (0-4095), reference is 3.3V
+    // VSYS is divided by 3 before ADC
+    // So: VSYS = (adc_raw / 4095) * 3.3V * 3
+    float vsys = (adc_raw / 4095.0f) * 3.3f * 3.0f;
+    return vsys;
+}
+
+// Convert VSYS voltage to Horus battery field (0-255, decoded as value/51)
+static uint8_t vsys_to_horus_battery(float vsys) {
+    // Horus decoder: voltage = battery / 51.0
+    // So: battery = voltage * 51
+    int raw = (int)(vsys * 51.0f + 0.5f);
+    if (raw < 0) raw = 0;
+    if (raw > 255) raw = 255;
+    return (uint8_t)raw;
+}
+
+// Read internal temperature sensor (RP2040 core temperature)
+static float read_core_temperature(void) {
+    init_vsys_adc();  // Ensure ADC is initialized
+    adc_set_temp_sensor_enabled(true);
+    adc_select_input(4);  // ADC4 = internal temperature sensor
+    
+    // Average multiple readings
+    uint32_t sum = 0;
+    for (int i = 0; i < 16; i++) {
+        sum += adc_read();
+    }
+    uint16_t adc_raw = sum / 16;
+    
+    // Convert to temperature
+    // T = 27 - (ADC_voltage - 0.706) / 0.001721
+    float adc_voltage = (adc_raw / 4095.0f) * 3.3f;
+    float temp_c = 27.0f - (adc_voltage - 0.706f) / 0.001721f;
+    
+    return temp_c;
+}
+
+// ============================================================================
+// GPS ATGM336H - NMEA Parser
+// ============================================================================
+
+// GPS data structure
+typedef struct {
+    bool valid;              // GPS fix valid
+    uint8_t hours;
+    uint8_t minutes;
+    uint8_t seconds;
+    float latitude;          // Decimal degrees, + = North
+    float longitude;         // Decimal degrees, + = East
+    uint16_t altitude;       // Meters
+    uint8_t satellites;
+    uint8_t speed_knots;     // Speed in knots
+} gps_data_t;
+
+static gps_data_t gps_data = {0};
+static char nmea_buffer[128];
+static uint8_t nmea_idx = 0;
+static bool gps_initialized = false;
+
+// Initialize GPS power control pins and UART
+static void gps_init(void) {
+    if (gps_initialized) return;
+    
+    // Setup GPS GND control pins (active LOW = GPS ON)
+    gpio_init(GPS_GND_PIN1);
+    gpio_init(GPS_GND_PIN2);
+    gpio_init(GPS_GND_PIN3);
+    gpio_set_dir(GPS_GND_PIN1, GPIO_OUT);
+    gpio_set_dir(GPS_GND_PIN2, GPIO_OUT);
+    gpio_set_dir(GPS_GND_PIN3, GPIO_OUT);
+    
+    // Turn GPS ON (GND pins LOW)
+    gpio_put(GPS_GND_PIN1, 0);
+    gpio_put(GPS_GND_PIN2, 0);
+    gpio_put(GPS_GND_PIN3, 0);
+    
+    // Setup UART for GPS
+    uart_init(GPS_UART, GPS_BAUD);
+    gpio_set_function(GPS_UART_RX, GPIO_FUNC_UART);
+    
+    gps_initialized = true;
+}
+
+// Turn GPS power ON
+static void gps_power_on(void) {
+    gpio_put(GPS_GND_PIN1, 0);
+    gpio_put(GPS_GND_PIN2, 0);
+    gpio_put(GPS_GND_PIN3, 0);
+}
+
+// Turn GPS power OFF
+static void gps_power_off(void) {
+    gpio_put(GPS_GND_PIN1, 1);
+    gpio_put(GPS_GND_PIN2, 1);
+    gpio_put(GPS_GND_PIN3, 1);
+}
+
+// Parse NMEA latitude/longitude field (format: DDMM.MMMM or DDDMM.MMMM)
+static float nmea_parse_coord(const char *str, int deg_digits) {
+    if (!str || !*str) return 0.0f;
+    
+    char deg_str[4] = {0};
+    strncpy(deg_str, str, deg_digits);
+    int degrees = atoi(deg_str);
+    
+    float minutes = atof(str + deg_digits);
+    return degrees + minutes / 60.0f;
+}
+
+// Parse NMEA time field (HHMMSS.sss)
+static void nmea_parse_time(const char *str) {
+    if (!str || strlen(str) < 6) return;
+    
+    char buf[3] = {0};
+    buf[0] = str[0]; buf[1] = str[1];
+    gps_data.hours = atoi(buf);
+    
+    buf[0] = str[2]; buf[1] = str[3];
+    gps_data.minutes = atoi(buf);
+    
+    buf[0] = str[4]; buf[1] = str[5];
+    gps_data.seconds = atoi(buf);
+}
+
+// Get next field from NMEA sentence (modifies string)
+static char* nmea_next_field(char **ptr) {
+    if (!ptr || !*ptr) return NULL;
+    char *start = *ptr;
+    char *comma = strchr(start, ',');
+    if (comma) {
+        *comma = '\0';
+        *ptr = comma + 1;
+    } else {
+        *ptr = NULL;
+    }
+    return start;
+}
+
+// Parse GGA sentence (position + altitude + satellites)
+// $GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,47.0,M,,*47
+static void nmea_parse_gga(char *sentence) {
+    char *ptr = sentence;
+    char *field;
+    
+    // Skip $GPGGA,
+    field = nmea_next_field(&ptr);  // $GPGGA
+    
+    // Time
+    field = nmea_next_field(&ptr);
+    nmea_parse_time(field);
+    
+    // Latitude
+    field = nmea_next_field(&ptr);
+    float lat = nmea_parse_coord(field, 2);
+    
+    // N/S
+    field = nmea_next_field(&ptr);
+    if (field && *field == 'S') lat = -lat;
+    gps_data.latitude = lat;
+    
+    // Longitude
+    field = nmea_next_field(&ptr);
+    float lon = nmea_parse_coord(field, 3);
+    
+    // E/W
+    field = nmea_next_field(&ptr);
+    if (field && *field == 'W') lon = -lon;
+    gps_data.longitude = lon;
+    
+    // Fix quality (0=invalid, 1=GPS, 2=DGPS)
+    field = nmea_next_field(&ptr);
+    int fix = field ? atoi(field) : 0;
+    gps_data.valid = (fix > 0);
+    
+    // Number of satellites
+    field = nmea_next_field(&ptr);
+    gps_data.satellites = field ? atoi(field) : 0;
+    
+    // HDOP (skip)
+    field = nmea_next_field(&ptr);
+    
+    // Altitude
+    field = nmea_next_field(&ptr);
+    gps_data.altitude = field ? (uint16_t)atof(field) : 0;
+}
+
+// Parse RMC sentence (position + speed + time)
+// $GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A
+static void nmea_parse_rmc(char *sentence) {
+    char *ptr = sentence;
+    char *field;
+    
+    // Skip $GPRMC,
+    field = nmea_next_field(&ptr);  // $GPRMC
+    
+    // Time
+    field = nmea_next_field(&ptr);
+    nmea_parse_time(field);
+    
+    // Status (A=valid, V=invalid)
+    field = nmea_next_field(&ptr);
+    bool valid = (field && *field == 'A');
+    
+    // Latitude
+    field = nmea_next_field(&ptr);
+    float lat = nmea_parse_coord(field, 2);
+    
+    // N/S
+    field = nmea_next_field(&ptr);
+    if (field && *field == 'S') lat = -lat;
+    
+    // Longitude
+    field = nmea_next_field(&ptr);
+    float lon = nmea_parse_coord(field, 3);
+    
+    // E/W
+    field = nmea_next_field(&ptr);
+    if (field && *field == 'W') lon = -lon;
+    
+    // Speed in knots
+    field = nmea_next_field(&ptr);
+    uint8_t speed = field ? (uint8_t)atof(field) : 0;
+    
+    // Only update if valid
+    if (valid) {
+        gps_data.valid = true;
+        gps_data.latitude = lat;
+        gps_data.longitude = lon;
+        gps_data.speed_knots = speed;
+    }
+}
+
+// Process complete NMEA sentence
+static void nmea_process_sentence(char *sentence) {
+    // Check for GGA (has altitude and satellites)
+    if (strncmp(sentence, "$GPGGA", 6) == 0 || strncmp(sentence, "$GNGGA", 6) == 0) {
+        nmea_parse_gga(sentence);
+    }
+    // Check for RMC (has speed)
+    else if (strncmp(sentence, "$GPRMC", 6) == 0 || strncmp(sentence, "$GNRMC", 6) == 0) {
+        nmea_parse_rmc(sentence);
+    }
+}
+
+// Process incoming GPS data - call frequently
+static void gps_process(void) {
+    while (uart_is_readable(GPS_UART)) {
+        char c = uart_getc(GPS_UART);
+        
+        if (c == '$') {
+            // Start of new sentence
+            nmea_idx = 0;
+            nmea_buffer[nmea_idx++] = c;
+        }
+        else if (c == '\r' || c == '\n') {
+            // End of sentence
+            if (nmea_idx > 0) {
+                nmea_buffer[nmea_idx] = '\0';
+                nmea_process_sentence(nmea_buffer);
+                nmea_idx = 0;
+            }
+        }
+        else if (nmea_idx < sizeof(nmea_buffer) - 1) {
+            nmea_buffer[nmea_idx++] = c;
+        }
+    }
+}
+
+// Get current GPS data (copies to provided structure)
+static void gps_get_data(gps_data_t *data) {
+    if (data) {
+        *data = gps_data;
+    }
+}
+
+// ============================================================================
+
+// Golay (23,12) constants - polynomial is 0xC75 (AE3 reversed)
+#define GOLAY_POLYNOMIAL 0xC75
+
+// Golay syndrome calculator - exactly as in horusdemodlib
+static int golay23_syndrome(int c) {
+    int x;
+    for (x = 11; x >= 0; x--) {
+        if (c & ((1 << 11) << x)) {
+            c ^= GOLAY_POLYNOMIAL << x;
+        }
+    }
+    return c;
+}
+
+// CRC16 CCITT (same as used by Horus)
+static uint16_t horus_crc16(uint8_t *data, uint8_t length) {
+    uint8_t x;
+    uint16_t crc = 0xFFFF;
+    while (length--) {
+        x = crc >> 8 ^ *data++;
+        x ^= x >> 4;
+        crc = (crc << 8) ^ ((uint16_t)(x << 12)) ^ ((uint16_t)(x << 5)) ^ ((uint16_t)x);
+    }
+    return crc;
+}
+
+// Prime numbers for algebraic interleaver - MUST match horusdemodlib exactly!
+static const uint16_t primes[] = {
+    2,      3,      5,      7,      11,     13,     17,     19,     23,     29, 
+    31,     37,     41,     43,     47,     53,     59,     61,     67,     71, 
+    73,     79,     83,     89,     97,     101,    103,    107,    109,    113, 
+    127,    131,    137,    139,    149,    151,    157,    163,    167,    173, 
+    179,    181,    191,    193,    197,    199,    211,    223,    227,    229, 
+    233,    239,    241,    251,    257,    263,    269,    271,    277,    281, 
+    283,    293,    307,    311,    313,    317,    331,    337,    347,    349,
+    379,    383,    389,    757,    761,    769,    773
+};
+
+// Algebraic interleaver (in-place) - exactly as in horusdemodlib
+// Uses LSB-first bit ordering within bytes
+static void horus_interleave(uint8_t *inout, int nbytes) {
+    uint16_t nbits = (uint16_t)nbytes * 8;
+    uint32_t i, j, n, ibit, ibyte, ishift, jbyte, jshift;
+    uint32_t b;
+    uint8_t out[64];  // Max packet size
+    
+    memset(out, 0, nbytes);
+    
+    // Find nearest prime less than nbits (co-prime with nbits)
+    i = 1;
+    uint16_t imax = sizeof(primes) / sizeof(uint16_t);
+    while ((primes[i] < nbits) && (i < imax))
+        i++;
+    b = primes[i - 1];
+    
+    for (n = 0; n < nbits; n++) {
+        i = n;
+        j = (b * i) % nbits;  // Must be 32-bit to avoid overflow
+        
+        // Read bit i (LSB-first within byte)
+        ibyte = i / 8;
+        ishift = i % 8;  // LSB-first
+        ibit = (inout[ibyte] >> ishift) & 0x1;
+        
+        // Write to bit j position (LSB-first within byte)
+        jbyte = j / 8;
+        jshift = j % 8;  // LSB-first
+        out[jbyte] |= ibit << jshift;
+    }
+    
+    memcpy(inout, out, nbytes);
+}
+
+// DVB 16-bit additive scrambler (in-place) - exactly as in horusdemodlib
+// Uses LSB-first bit ordering within bytes
+static void horus_scramble(uint8_t *inout, int nbytes) {
+    int nbits = nbytes * 8;
+    int i, ibit, ibits, ibyte, ishift, mask;
+    uint16_t scrambler = 0x4a80;  // Init at start of every frame
+    uint16_t scrambler_out;
+    
+    for (i = 0; i < nbits; i++) {
+        // Generate scrambler output bit
+        scrambler_out = ((scrambler & 0x2) >> 1) ^ (scrambler & 0x1);
+        
+        // Modify i-th bit by XOR with scrambler output (LSB-first)
+        ibyte = i / 8;
+        ishift = i % 8;  // LSB-first
+        ibit = (inout[ibyte] >> ishift) & 0x1;
+        ibits = ibit ^ scrambler_out;
+        
+        // Clear and set bit
+        mask = 1 << ishift;
+        inout[ibyte] &= ~mask;
+        inout[ibyte] |= ibits << ishift;
+        
+        // Update scrambler LFSR
+        scrambler >>= 1;
+        scrambler |= scrambler_out << 14;
+    }
+}
+
+// Calculate number of TX data bytes for given payload size
+static int horus_get_num_tx_bytes(int num_payload_bytes) {
+    int num_payload_bits = num_payload_bytes * 8;
+    int num_golay_codewords = num_payload_bits / 12;
+    if (num_payload_bits % 12)
+        num_golay_codewords++;
+    
+    int num_tx_bits = 2 * 8 + num_payload_bits + num_golay_codewords * 11;  // 2 = UW size
+    int num_tx_bytes = num_tx_bits / 8;
+    if (num_tx_bits % 8)
+        num_tx_bytes++;
+    
+    return num_tx_bytes;
+}
+
+// Encode packet with Golay FEC, interleaving, scrambling
+// Output includes unique word ($$) at start
+// EXACTLY matches horusdemodlib/src/horus_l2.c horus_l2_encode_tx_packet()
+static int horus_l2_encode_packet(uint8_t *output, uint8_t *input, int num_payload_bytes) {
+    static const uint8_t uw[] = {'$', '$'};
+    int num_tx_bytes = horus_get_num_tx_bytes(num_payload_bytes);
+    uint8_t *pout = output;
+    int ninbit, ningolay, nparitybits;
+    int32_t ingolay, paritybyte, inbit, golayparity;
+    int ninbyte, shift, golayparitybit, i;
+    int num_payload_bits = num_payload_bytes * 8;
+    
+    // Copy unique word
+    memcpy(pout, uw, sizeof(uw));
+    pout += sizeof(uw);
+    
+    // Copy payload data
+    memcpy(pout, input, num_payload_bytes);
+    pout += num_payload_bytes;
+    
+    // Generate Golay parity bits
+    // Read input bits one at a time, MSB first
+    // Fill input Golay codeword, find output parity, write MSB first
+    ninbit = 0;
+    ingolay = 0;
+    ningolay = 0;
+    paritybyte = 0;
+    nparitybits = 0;
+    
+    while (ninbit < num_payload_bits) {
+        // Extract input data bit (MSB first)
+        ninbyte = ninbit / 8;
+        shift = 7 - (ninbit % 8);  // MSB first
+        inbit = (input[ninbyte] >> shift) & 0x1;
+        ninbit++;
+        
+        // Build up input golay codeword
+        ingolay = ingolay | inbit;
+        ningolay++;
+        
+        // When we get 12 bits do a Golay encode
+        if (ningolay % 12) {
+            ingolay <<= 1;
+        } else {
+            // Get parity for this 12-bit word
+            golayparity = golay23_syndrome(ingolay << 11);
+            ingolay = 0;
+            
+            // Write 11 parity bits to output data (MSB first)
+            for (i = 0; i < 11; i++) {
+                golayparitybit = (golayparity >> (10 - i)) & 0x1;
+                paritybyte = paritybyte | golayparitybit;
+                nparitybits++;
+                if (nparitybits % 8) {
+                    paritybyte <<= 1;
+                } else {
+                    // Full byte ready
+                    *pout++ = (uint8_t)paritybyte;
+                    paritybyte = 0;
+                }
+            }
+        }
+    }
+    
+    // Complete final Golay encode if we have partially finished ingolay
+    if (ningolay % 12) {
+        ingolay >>= 1;  // Remove extra shift from last iteration
+        golayparity = golay23_syndrome(ingolay << 12);
+        
+        // Write parity bits to output data
+        for (i = 0; i < 11; i++) {
+            golayparitybit = (golayparity >> (10 - i)) & 0x1;
+            paritybyte = paritybyte | golayparitybit;
+            nparitybits++;
+            if (nparitybits % 8) {
+                paritybyte <<= 1;
+            } else {
+                // Full byte ready
+                *pout++ = (uint8_t)paritybyte;
+                paritybyte = 0;
+            }
+        }
+    }
+    
+    // Final partial parity byte (use MS bits first)
+    if (nparitybits % 8) {
+        paritybyte <<= 7 - (nparitybits % 8);
+        *pout++ = (uint8_t)paritybyte;
+    }
+    
+    // Interleave (skip UW - don't interleave $$)
+    horus_interleave(&output[sizeof(uw)], num_tx_bytes - 2);
+    
+    // Scramble (skip UW - don't scramble $$)
+    horus_scramble(&output[sizeof(uw)], num_tx_bytes - 2);
+    
+    return num_tx_bytes;
+}
+
+// Horus v2 packet structure (32 bytes)
+// Based on: https://github.com/projecthorus/horusdemodlib/wiki/4-Packet-Format-Details
+typedef struct __attribute__((packed)) {
+    uint16_t payload_id;     // 0-1
+    uint16_t counter;        // 2-3
+    uint8_t hours;           // 4
+    uint8_t minutes;         // 5
+    uint8_t seconds;         // 6
+    float latitude;          // 7-10 (IEEE 754 float)
+    float longitude;         // 11-14 (IEEE 754 float)
+    uint16_t altitude;       // 15-16
+    uint8_t speed;           // 17
+    uint8_t sats;            // 18
+    int8_t temperature;      // 19
+    uint8_t battery;         // 20
+    uint8_t custom[9];       // 21-29 (custom data)
+    uint16_t checksum;       // 30-31
+} horus_v2_packet_t;
+
+// Telemetry data - defaults to zeros when no GPS fix
+static horus_v2_packet_t horus_packet_data = {
+    .payload_id = 256,
+    .counter = 0,
+    .hours = 0,
+    .minutes = 0,
+    .seconds = 0,
+    .latitude = 0.0f,
+    .longitude = 0.0f,
+    .altitude = 0,
+    .speed = 0,
+    .sats = 0,
+    .temperature = 20,
+    .battery = 189,      // Will be updated with real VSYS measurement
+    .custom = {0},
+    .checksum = 0
+};
+
+// Build and encode Horus v2 packet
+static int build_horus_v2_encoded(uint8_t *output) {
+    // Update packet fields
+    horus_packet_data.payload_id = horus_payload_id;
+    horus_packet_data.counter = (uint16_t)(horus_packet_count & 0xFFFF);
+    
+    // Get GPS data
+    gps_data_t gps;
+    gps_get_data(&gps);
+    
+    // Update from GPS if valid
+    if (gps.valid) {
+        horus_packet_data.hours = gps.hours;
+        horus_packet_data.minutes = gps.minutes;
+        horus_packet_data.seconds = gps.seconds;
+        horus_packet_data.latitude = gps.latitude;
+        horus_packet_data.longitude = gps.longitude;
+        horus_packet_data.altitude = gps.altitude;
+        horus_packet_data.speed = gps.speed_knots;
+        horus_packet_data.sats = gps.satellites;
+    } else {
+        // No GPS fix - use time since boot, zero coordinates
+        uint32_t now_s = time_us_32() / 1000000;
+        horus_packet_data.hours = (now_s / 3600) % 24;
+        horus_packet_data.minutes = (now_s / 60) % 60;
+        horus_packet_data.seconds = now_s % 60;
+        horus_packet_data.latitude = 0.0f;
+        horus_packet_data.longitude = 0.0f;
+        horus_packet_data.altitude = 0;
+        horus_packet_data.speed = 0;
+        horus_packet_data.sats = 0;
+    }
+    
+    // Read real VSYS voltage and convert to Horus format
+    float vsys = read_vsys_voltage();
+    horus_packet_data.battery = vsys_to_horus_battery(vsys);
+    
+    // Read core temperature
+    float temp = read_core_temperature();
+    horus_packet_data.temperature = (int8_t)temp;  // Truncate to integer
+    
+    // Calculate CRC over first 30 bytes
+    horus_packet_data.checksum = horus_crc16((uint8_t*)&horus_packet_data, 30);
+    
+    // Encode with Golay FEC
+    return horus_l2_encode_packet(output, (uint8_t*)&horus_packet_data, 32);
+}
+
+// ============================================================================
+// TRUE 4FSK Transmission - Direct frequency control
+// ============================================================================
+
+// Set carrier frequency directly (for 4FSK)
+static void horus_set_freq(uint32_t freq_hz) {
+    uint32_t frf = (uint32_t)((double)freq_hz / FSTEP_HZ);
+    sx_write(REG_FRF_MSB, (frf >> 16) & 0xFF);
+    sx_write(REG_FRF_MID, (frf >> 8) & 0xFF);
+    sx_write(REG_FRF_LSB, frf & 0xFF);
+}
+
+// Set FSK deviation in Hz
+static void horus_set_fdev(uint16_t fdev_hz) {
+    uint16_t fdev = (uint16_t)(fdev_hz / FSTEP_HZ);
+    sx_write(REG_FDEV_MSB, (fdev >> 8) & 0x3F);
+    sx_write(REG_FDEV_LSB, fdev & 0xFF);
+}
+
+// Setup radio for TRUE 4FSK using DIO2 continuous mode
+// 4FSK tones: base-405Hz, base-135Hz, base+135Hz, base+405Hz
+// DIO2=0 -> -FDEV, DIO2=1 -> +FDEV
+// We change FDEV between 135Hz and 405Hz, and toggle DIO2
+static void horus_tx_start(void) {
+    // Stop any current transmission
+    tone_off();
+    
+    // Initialize DIO2 as output
+    gpio_init(PIN_DIO2);
+    gpio_set_dir(PIN_DIO2, GPIO_OUT);
+    gpio_put(PIN_DIO2, 0);
+    
+    // Go to sleep to change mode
+    sx_write(REG_OP_MODE, MODE_SLEEP);
+    sleep_ms(1);
+    
+    // FSK mode, standby
+    sx_write(REG_OP_MODE, 0x01);
+    sleep_ms(1);
+    
+    // Set base frequency (center of 4FSK)
+    double corrected_freq = (double)base_freq_hz * (1.0 + ppm_correction / 1000000.0);
+    // Shift base up by 405Hz so our tones are: 0, 270, 540, 810 Hz from original base
+    horus_set_freq((uint32_t)(corrected_freq + 405));
+    
+    // Initial deviation
+    horus_set_fdev(405);
+    
+    // Continuous mode with DIO2 as data input
+    // RegPacketConfig2: DataMode = Continuous (bit 6 = 0)
+    uint8_t pkt2 = sx_read(REG_PACKET_CONFIG2);
+    sx_write(REG_PACKET_CONFIG2, pkt2 & 0xBF);  // Clear bit 6
+    
+    // RegPllHop (0x44): Enable fast frequency hopping
+    sx_write(0x44, 0x80);
+    
+    // PA config - full power +20dBm
+    sx_write(REG_PA_CONFIG, 0x8F);
+    sx_write(0x4D, 0x87);  // RegPaDac: Enable +20dBm high power mode
+    
+    // Start TX
+    sx_write(REG_OP_MODE, MODE_TX);
+    sleep_ms(2);
+}
+
+// Stop 4FSK and restore FM mode for SSTV  
+static void horus_tx_stop(void) {
+    // Go to standby
+    sx_write(REG_OP_MODE, MODE_STDBY);
+    sleep_ms(1);
+    
+    // Restore FSK packet mode for SSTV
+    sx_write(REG_OP_MODE, MODE_SLEEP);
+    sleep_ms(1);
+    sx_write(REG_OP_MODE, 0x01);
+    sleep_ms(1);
+    
+    // Restore FM deviation
+    uint16_t fdev = (uint16_t)(FM_DEVIATION_HZ / FSTEP_HZ);
+    sx_write(REG_FDEV_MSB, (fdev >> 8) & 0x3F);
+    sx_write(REG_FDEV_LSB, fdev & 0xFF);
+    
+    // Restore base frequency
+    double corrected_freq = (double)base_freq_hz * (1.0 + ppm_correction / 1000000.0);
+    uint32_t frf = (uint32_t)(corrected_freq / FSTEP_HZ);
+    sx_write(REG_FRF_MSB, (frf >> 16) & 0xFF);
+    sx_write(REG_FRF_MID, (frf >> 8) & 0xFF);
+    sx_write(REG_FRF_LSB, frf & 0xFF);
+    
+    // Restore bitrate
+    set_bitrate(2400);
+    
+    // Restore packet mode
+    uint8_t pkt2 = sx_read(REG_PACKET_CONFIG2);
+    sx_write(REG_PACKET_CONFIG2, pkt2 | 0x40);  // Set bit 6
+    
+    sx_write(REG_OP_MODE, MODE_STDBY);
+    sleep_ms(1);
+}
+
+// Transmit single 4FSK symbol using DIO2 + FDEV control
+// Symbol mapping (with base freq shifted +405Hz):
+//   Symbol 0: DIO2=0, FDEV=405 -> base-405 = original base + 0 Hz
+//   Symbol 1: DIO2=0, FDEV=135 -> base-135 = original base + 270 Hz
+//   Symbol 2: DIO2=1, FDEV=135 -> base+135 = original base + 540 Hz
+//   Symbol 3: DIO2=1, FDEV=405 -> base+405 = original base + 810 Hz
+static void horus_tx_symbol(uint8_t symbol) {
+    switch (symbol & 0x03) {
+        case 0:  // Lowest tone: -405Hz from center
+            gpio_put(PIN_DIO2, 0);
+            horus_set_fdev(405);
+            break;
+        case 1:  // Second tone: -135Hz from center
+            gpio_put(PIN_DIO2, 0);
+            horus_set_fdev(135);
+            break;
+        case 2:  // Third tone: +135Hz from center
+            gpio_put(PIN_DIO2, 1);
+            horus_set_fdev(135);
+            break;
+        case 3:  // Highest tone: +405Hz from center
+            gpio_put(PIN_DIO2, 1);
+            horus_set_fdev(405);
+            break;
+    }
+    
+    // Hold for symbol duration (10ms at 100 baud)
+    sleep_us(HORUS_SYMBOL_US);
+}
+
+// Send complete Horus v2 telemetry frame
+
+void send_horus_telemetry(void) {
+    // STATIC buffers to avoid stack issues
+    static uint8_t tx_packet[72];
+    static uint8_t raw_copy[32];  // Copy of raw data before encoding
+    static char log_buf[512];
+    static const char hex[] = "0123456789ABCDEF";
+    
+    // Copy raw payload BEFORE encoding (in case encoder modifies it)
+    memcpy(raw_copy, (uint8_t*)&horus_packet_data, 32);
+    
+    // Encode packet
+    int tx_len = build_horus_v2_encoded(tx_packet);
+    
+    // Build debug log: R=raw, E=final encoded
+    char* p = log_buf;
+    
+    // RAW (32 bytes = 64 hex chars)
+    *p++ = 'R'; *p++ = ':';
+    for (int i = 0; i < 32; i++) {
+        *p++ = hex[raw_copy[i] >> 4];
+        *p++ = hex[raw_copy[i] & 0xF];
+    }
+    *p++ = '\n';
+    
+    // ENC final - full encoded packet
+    *p++ = 'E'; *p++ = ':';
+    for (int i = 0; i < tx_len; i++) {
+        *p++ = hex[tx_packet[i] >> 4];
+        *p++ = hex[tx_packet[i] & 0xF];
+    }
+    *p++ = '\n';
+    
+    msc_disk_overwrite_file("HORUS.TXT", (const uint8_t*)log_buf, p - log_buf);
+    
+    // Start 4FSK transmission (direct carrier frequency control)
+    horus_tx_start();
+    
+    // Preamble: 32 bytes of 0x1B for FSK modem sync (longer for reliable lock)
+    for (int i = 0; i < 32; i++) {
+        uint8_t byte = 0x1B;
+        for (int b = 0; b < 4; b++) {
+            uint8_t symbol = (byte >> 6) & 0x03;
+            horus_tx_symbol(symbol);
+            byte <<= 2;
+        }
+    }
+    
+    // Transmit encoded packet (includes $$ unique word)
+    for (int i = 0; i < tx_len; i++) {
+        uint8_t byte = tx_packet[i];
+        for (int b = 0; b < 4; b++) {
+            uint8_t symbol = (byte >> 6) & 0x03;
+            horus_tx_symbol(symbol);
+            byte <<= 2;
+        }
+    }
+    
+    // Stop 4FSK transmission
+    horus_tx_stop();
+    horus_packet_count++;
+}
+
+// Update telemetry data (call this with real GPS/sensor data)
+void horus_update_telemetry(uint8_t h, uint8_t m, uint8_t s,
+                            float lat, float lon, uint16_t alt,
+                            uint8_t spd, uint8_t sats,
+                            int8_t temp, uint8_t batt) {
+    horus_packet_data.hours = h;
+    horus_packet_data.minutes = m;
+    horus_packet_data.seconds = s;
+    horus_packet_data.latitude = lat;
+    horus_packet_data.longitude = lon;
+    horus_packet_data.altitude = alt;
+    horus_packet_data.speed = spd;
+    horus_packet_data.sats = sats;
+    horus_packet_data.temperature = temp;
+    horus_packet_data.battery = batt;
+}
+
+// ============================================================================
 // SX1276 functions
+// ============================================================================
 static inline void cs_sel() { gpio_put(PIN_CS, 0); }
 static inline void cs_desel() { gpio_put(PIN_CS, 1); }
 
@@ -314,6 +1177,7 @@ void init_radio(void) {
     set_bitrate(2400);
     
     sx_write(REG_PA_CONFIG, 0x8F);
+    sx_write(0x4D, 0x87);  // RegPaDac: Enable +20dBm high power mode
     sx_write(REG_PA_RAMP, 0x09);
     
     sx_write(REG_PREAMBLE_MSB, 0x00);
@@ -531,10 +1395,11 @@ int main(void) {
     stdio_init_all();
     
     // Check GP5 for force-format jumper (active low)
+    // Note: GP2,GP3,GP4 are used for GPS GND control
     gpio_init(5);
     gpio_set_dir(5, GPIO_IN);
     gpio_pull_up(5);
-    sleep_ms(10); // let pull-up settle
+    sleep_ms(10);
     
     // USB MSC init
     tusb_init();
@@ -542,13 +1407,16 @@ int main(void) {
     
     // If GP5 is grounded, force format the flash
     if (!gpio_get(5)) {
-        printf("GP5 grounded — forcing flash format...\n");
+        printf("GP5 grounded - forcing flash format...\n");
         msc_disk_format();
         const char* cfg_name_fmt = "config.txt";
-        const char* default_cfg_fmt = "freq=434.500\nppm=0.0\ninterval=3\nmode=robot36\n";
+        const char* default_cfg_fmt = "freq=434.500\nppm=0.0\ninterval=3\nmode=robot36\nhorus=0\nhorus_id=256\nhorus_count=1\n";
         msc_disk_create_file_if_missing(cfg_name_fmt, (const uint8_t*)default_cfg_fmt, strlen(default_cfg_fmt));
         printf("Format complete. Remove GP5 jumper and reset.\n");
     }
+    
+    // Initialize GPS (ATGM336H)
+    gps_init();
 
     // Wait for USB host to enumerate/mount the device before starting radio
     printf("Waiting for USB host to mount device (10s timeout)...\n");
@@ -565,17 +1433,27 @@ int main(void) {
 
     // Ensure config file exists; create with default if missing
     const char* cfg_name = "config.txt";
-    const char* default_cfg = "freq=434.500\nppm=0.0\ninterval=3\nmode=robot36\n";
+    const char* default_cfg = "freq=434.500\nppm=0.0\ninterval=3\nmode=robot36\nhorus=0\nhorus_id=256\nhorus_count=1\n";
     if (msc_disk_create_file_if_missing(cfg_name, (const uint8_t*)default_cfg, strlen(default_cfg))) {
+    
+    // Create HORUS.TXT for debug output (512 bytes for full packet dump)
+    char horus_init[512];
+    memset(horus_init, '.', 511);
+    horus_init[511] = '\n';
+    msc_disk_create_file_if_missing("HORUS.TXT", (const uint8_t*)horus_init, 512);
+    
         uint32_t cfg_size;
         const uint8_t* cfg_data = msc_disk_find_file(cfg_name, &cfg_size);
         if (cfg_data && cfg_size > 0) {
-            // Parse config: freq=xxx.xxx, ppm=x.x, interval=x, mode=robot36|pd120
+            // Parse config: freq=xxx.xxx, ppm=x.x, interval=x, mode=robot36|pd120, horus=0|1, horus_id=N, horus_count=N
             bool config_valid = false;
             float freq_mhz = 0.0f;
             float ppm_val = 0.0f;
             uint32_t interval_val = 3;
             sstv_mode_t mode_val = SSTV_ROBOT36;
+            bool horus_val = false;
+            uint16_t horus_id_val = 256;
+            uint32_t horus_count_val = 1;
             
             // Simple line-by-line parser
             const char* p = (const char*)cfg_data;
@@ -659,6 +1537,37 @@ int main(void) {
                     // Skip to end of line
                     while (p < end && *p != '\n' && *p != '\r') p++;
                 }
+                // Check for horus= (0 or 1)
+                else if (strncmp(p, "horus=", 6) == 0) {
+                    p += 6;
+                    if (*p == '1') horus_val = true;
+                    else horus_val = false;
+                    while (p < end && *p != '\n' && *p != '\r') p++;
+                }
+                // Check for horus_id=
+                else if (strncmp(p, "horus_id=", 9) == 0) {
+                    p += 9;
+                    horus_id_val = 0;
+                    while (p < end && *p != '\n' && *p != '\r') {
+                        if (*p >= '0' && *p <= '9') {
+                            horus_id_val = horus_id_val * 10 + (*p - '0');
+                        }
+                        p++;
+                    }
+                }
+                // Check for horus_count=
+                else if (strncmp(p, "horus_count=", 12) == 0) {
+                    p += 12;
+                    horus_count_val = 0;
+                    while (p < end && *p != '\n' && *p != '\r') {
+                        if (*p >= '0' && *p <= '9') {
+                            horus_count_val = horus_count_val * 10 + (*p - '0');
+                        }
+                        p++;
+                    }
+                    if (horus_count_val < 1) horus_count_val = 1;
+                    if (horus_count_val > 10) horus_count_val = 10;
+                }
                 
                 // Skip to next line
                 while (p < end && *p != '\n') p++;
@@ -670,9 +1579,16 @@ int main(void) {
                 ppm_correction = ppm_val;
                 tx_interval_sec = interval_val;
                 sstv_mode = mode_val;
+                horus_enabled = horus_val;
+                horus_payload_id = horus_id_val;
+                horus_tx_count = horus_count_val;
                 printf("Config OK: freq=%.3f MHz, ppm=%.1f, interval=%lu s, mode=%s\n", 
                        freq_mhz, ppm_correction, tx_interval_sec,
                        sstv_mode == SSTV_PD120 ? "PD120" : "Robot36");
+                if (horus_enabled) {
+                    printf("Horus v2 ENABLED: ID=%u, %lu packets/cycle\n", 
+                           horus_payload_id, horus_tx_count);
+                }
             } else {
                 // invalid config -> overwrite with default
                 printf("Config invalid, overwriting with default\n");
@@ -681,6 +1597,7 @@ int main(void) {
                 ppm_correction = 0.0f;
                 tx_interval_sec = 3;
                 sstv_mode = SSTV_ROBOT36;
+                horus_enabled = false;
             }
         }
     }
@@ -705,6 +1622,30 @@ int main(void) {
     
     init_radio();
     generate_test_image();  // default test pattern
+    
+    // ========================================
+    // HORUS TEST MODE - nadaj 5 pakietów na start
+    // ========================================
+    printf("\n*** HORUS TEST MODE ***\n");
+    printf("Sending 5 Horus packets for testing...\n");
+    for (int test_pkt = 0; test_pkt < 5; test_pkt++) {
+        printf("\n--- Test packet %d/5 ---\n", test_pkt + 1);
+        
+        // Process GPS data before sending
+        gps_process();
+        
+        send_horus_telemetry();
+        
+        // 3 second pause between packets
+        printf("Waiting 3s...\n");
+        for (int d = 0; d < 300; d++) {
+            tud_task();
+            gps_process();
+            sleep_ms(10);
+        }
+    }
+    printf("*** HORUS TEST COMPLETE ***\n\n");
+    // ========================================
     
     printf("Waiting for BMP file...\n");
     
@@ -756,6 +1697,7 @@ int main(void) {
     
     while (1) {
         tud_task();  // USB handling
+        gps_process();  // Process GPS NMEA data
         
         // Detect disk write
         if (msc_disk_has_new_image()) {
@@ -829,12 +1771,13 @@ int main(void) {
 
                         // Recreate config.txt with default and reset config values
                         const char* cfg_name2 = "config.txt";
-                        const char* default_cfg2 = "freq=434.500\nppm=0.0\ninterval=3\nmode=robot36\n";
+                        const char* default_cfg2 = "freq=434.500\nppm=0.0\ninterval=3\nmode=robot36\nhorus=0\nhorus_id=256\nhorus_count=1\n";
                         msc_disk_create_file_if_missing(cfg_name2, (const uint8_t*)default_cfg2, strlen(default_cfg2));
                         base_freq_hz = BASE_FREQ_HZ;
                         ppm_correction = 0.0f;
                         tx_interval_sec = 3;
                         sstv_mode = SSTV_ROBOT36;
+                        horus_enabled = false;
                         printf("Format complete; default config restored.\n");
                     }
                 }
@@ -843,6 +1786,34 @@ int main(void) {
         
         // Transmit if image loaded, then wait
         if (image_loaded) {
+            // Send Horus telemetry BEFORE SSTV image (if enabled)
+            if (horus_enabled) {
+                printf("\n--- Horus v2 telemetry (%lu packets) ---\n", horus_tx_count);
+                for (uint32_t h = 0; h < horus_tx_count; h++) {
+                    // Process GPS data before each packet
+                    gps_process();
+                    
+                    send_horus_telemetry();
+                    
+                    // Small delay between packets
+                    if (h + 1 < horus_tx_count) {
+                        for (int d = 0; d < 100; d++) {
+                            tud_task();
+                            gps_process();
+                            sleep_ms(10);
+                        }
+                    }
+                }
+                printf("--- Horus done, 2s pause before SSTV ---\n");
+                
+                // 2 second delay between Horus and SSTV
+                for (int d = 0; d < 200; d++) {
+                    tud_task();
+                    gps_process();
+                    sleep_ms(10);
+                }
+            }
+            
             printf("\n=== TX START (file %d/%d: %s) ===\n", curr_img_idx + 1, img_count > 0 ? img_count : 1,
                    img_count > 0 ? img_list[curr_img_idx].name : "test");
             send_sstv_image();
@@ -874,9 +1845,10 @@ int main(void) {
                 }
             }
 
-            // Wait tx_interval_sec seconds, but keep USB alive
+            // Wait tx_interval_sec seconds, but keep USB and GPS alive
             for (uint32_t i = 0; i < tx_interval_sec * 100; i++) {
                 tud_task();
+                gps_process();
                 sleep_ms(10);
                 if (msc_disk_has_new_image()) {
                     last_change = time_us_32();
