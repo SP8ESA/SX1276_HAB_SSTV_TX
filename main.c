@@ -22,6 +22,7 @@ void feed_fifo(void);
 void sx_write(uint8_t reg, uint8_t val);
 uint8_t sx_read(uint8_t reg);
 void set_bitrate(uint32_t br);
+void init_radio(void);
 
 #define PIN_SCK   10
 #define PIN_MOSI  11
@@ -857,23 +858,15 @@ static void horus_set_freq(uint32_t freq_hz) {
 
 // Set FSK deviation in Hz
 static void horus_set_fdev(uint16_t fdev_hz) {
-    uint16_t fdev = (uint16_t)(fdev_hz / FSTEP_HZ);
+    uint16_t fdev = (uint16_t)((float)fdev_hz / FSTEP_HZ);
     sx_write(REG_FDEV_MSB, (fdev >> 8) & 0x3F);
     sx_write(REG_FDEV_LSB, fdev & 0xFF);
 }
 
-// Setup radio for TRUE 4FSK using DIO2 continuous mode
-// 4FSK tones: base-405Hz, base-135Hz, base+135Hz, base+405Hz
-// DIO2=0 -> -FDEV, DIO2=1 -> +FDEV
-// We change FDEV between 135Hz and 405Hz, and toggle DIO2
+// Setup radio for TRUE 4FSK - STDBY/TX switching (good power)
 static void horus_tx_start(void) {
     // Stop any current transmission
     tone_off();
-    
-    // Initialize DIO2 as output
-    gpio_init(PIN_DIO2);
-    gpio_set_dir(PIN_DIO2, GPIO_OUT);
-    gpio_put(PIN_DIO2, 0);
     
     // Go to sleep to change mode
     sx_write(REG_OP_MODE, MODE_SLEEP);
@@ -883,29 +876,17 @@ static void horus_tx_start(void) {
     sx_write(REG_OP_MODE, 0x01);
     sleep_ms(1);
     
-    // Set base frequency (center of 4FSK)
-    double corrected_freq = (double)base_freq_hz * (1.0 + ppm_correction / 1000000.0);
-    // Shift base up by 405Hz so our tones are: 0, 270, 540, 810 Hz from original base
-    horus_set_freq((uint32_t)(corrected_freq + 405));
-    
-    // Initial deviation
-    horus_set_fdev(405);
-    
-    // Continuous mode with DIO2 as data input
-    // RegPacketConfig2: DataMode = Continuous (bit 6 = 0)
-    uint8_t pkt2 = sx_read(REG_PACKET_CONFIG2);
-    sx_write(REG_PACKET_CONFIG2, pkt2 & 0xBF);  // Clear bit 6
-    
-    // RegPllHop (0x44): Enable fast frequency hopping
-    sx_write(0x44, 0x80);
-    
-    // PA config - full power +20dBm
+    // PA config - same as init_radio
     sx_write(REG_PA_CONFIG, 0x8F);
-    sx_write(0x4D, 0x87);  // RegPaDac: Enable +20dBm high power mode
+    sx_write(REG_PA_RAMP, 0x09);
     
-    // Start TX
-    sx_write(REG_OP_MODE, MODE_TX);
-    sleep_ms(2);
+    // Zero deviation - pure carrier
+    sx_write(REG_FDEV_MSB, 0x00);
+    sx_write(REG_FDEV_LSB, 0x00);
+    
+    // Set initial frequency
+    double corrected_freq = (double)base_freq_hz * (1.0 + ppm_correction / 1000000.0);
+    horus_set_freq((uint32_t)corrected_freq);
 }
 
 // Stop 4FSK and restore FM mode for SSTV  
@@ -914,63 +895,38 @@ static void horus_tx_stop(void) {
     sx_write(REG_OP_MODE, MODE_STDBY);
     sleep_ms(1);
     
-    // Restore FSK packet mode for SSTV
-    sx_write(REG_OP_MODE, MODE_SLEEP);
-    sleep_ms(1);
-    sx_write(REG_OP_MODE, 0x01);
-    sleep_ms(1);
+    // Full radio reinit to restore all settings properly
+    init_radio();
+}
+
+// Transmit single 4FSK symbol - wait for mode ready, compensate timing
+// Symbol 0 = base (lowest), 1 = +270Hz, 2 = +540Hz, 3 = +810Hz (highest)
+__attribute__((noinline)) static void horus_tx_symbol(uint8_t symbol) {
+    uint32_t start_time = time_us_32();
     
-    // Restore FM deviation
-    uint16_t fdev = (uint16_t)(FM_DEVIATION_HZ / FSTEP_HZ);
-    sx_write(REG_FDEV_MSB, (fdev >> 8) & 0x3F);
-    sx_write(REG_FDEV_LSB, fdev & 0xFF);
+    // Calculate frequency for this symbol
+    uint32_t base = (uint32_t)((double)base_freq_hz * (1.0 + ppm_correction / 1000000.0));
+    uint32_t freq = base + (symbol & 0x03) * HORUS_TONE_SPACING;
+    uint32_t frf = (uint32_t)((double)freq / FSTEP_HZ);
     
-    // Restore base frequency
-    double corrected_freq = (double)base_freq_hz * (1.0 + ppm_correction / 1000000.0);
-    uint32_t frf = (uint32_t)(corrected_freq / FSTEP_HZ);
+    // STDBY and wait for mode ready
+    sx_write(REG_OP_MODE, MODE_STDBY);
+    while (!(sx_read(0x3E) & 0x80)) {}  // Wait for ModeReady (RegIrqFlags1 bit 7)
+    
+    // Write FRF registers
     sx_write(REG_FRF_MSB, (frf >> 16) & 0xFF);
     sx_write(REG_FRF_MID, (frf >> 8) & 0xFF);
     sx_write(REG_FRF_LSB, frf & 0xFF);
     
-    // Restore bitrate
-    set_bitrate(2400);
+    // TX and wait for mode ready
+    sx_write(REG_OP_MODE, MODE_TX);
+    while (!(sx_read(0x3E) & 0x80)) {}  // Wait for ModeReady
     
-    // Restore packet mode
-    uint8_t pkt2 = sx_read(REG_PACKET_CONFIG2);
-    sx_write(REG_PACKET_CONFIG2, pkt2 | 0x40);  // Set bit 6
-    
-    sx_write(REG_OP_MODE, MODE_STDBY);
-    sleep_ms(1);
-}
-
-// Transmit single 4FSK symbol using DIO2 + FDEV control
-// Symbol mapping (with base freq shifted +405Hz):
-//   Symbol 0: DIO2=0, FDEV=405 -> base-405 = original base + 0 Hz
-//   Symbol 1: DIO2=0, FDEV=135 -> base-135 = original base + 270 Hz
-//   Symbol 2: DIO2=1, FDEV=135 -> base+135 = original base + 540 Hz
-//   Symbol 3: DIO2=1, FDEV=405 -> base+405 = original base + 810 Hz
-static void horus_tx_symbol(uint8_t symbol) {
-    switch (symbol & 0x03) {
-        case 0:  // Lowest tone: -405Hz from center
-            gpio_put(PIN_DIO2, 0);
-            horus_set_fdev(405);
-            break;
-        case 1:  // Second tone: -135Hz from center
-            gpio_put(PIN_DIO2, 0);
-            horus_set_fdev(135);
-            break;
-        case 2:  // Third tone: +135Hz from center
-            gpio_put(PIN_DIO2, 1);
-            horus_set_fdev(135);
-            break;
-        case 3:  // Highest tone: +405Hz from center
-            gpio_put(PIN_DIO2, 1);
-            horus_set_fdev(405);
-            break;
+    // Calculate remaining time for this symbol
+    uint32_t elapsed = time_us_32() - start_time;
+    if (elapsed < HORUS_SYMBOL_US) {
+        sleep_us(HORUS_SYMBOL_US - elapsed);
     }
-    
-    // Hold for symbol duration (10ms at 100 baud)
-    sleep_us(HORUS_SYMBOL_US);
 }
 
 // Send complete Horus v2 telemetry frame
@@ -1013,23 +969,24 @@ void send_horus_telemetry(void) {
     horus_tx_start();
     
     // Preamble: 32 bytes of 0x1B for FSK modem sync (longer for reliable lock)
+    // 0x1B = 00 01 10 11 = symbols 0,1,2,3
+    // MSB-first: send bits 7-6, then 5-4, then 3-2, then 1-0
     for (int i = 0; i < 32; i++) {
-        uint8_t byte = 0x1B;
-        for (int b = 0; b < 4; b++) {
-            uint8_t symbol = (byte >> 6) & 0x03;
-            horus_tx_symbol(symbol);
-            byte <<= 2;
-        }
+        // Unrolled loop - send all 4 symbols explicitly
+        horus_tx_symbol(0);  // bits 7-6 = 00
+        horus_tx_symbol(1);  // bits 5-4 = 01
+        horus_tx_symbol(2);  // bits 3-2 = 10
+        horus_tx_symbol(3);  // bits 1-0 = 11
     }
     
     // Transmit encoded packet (includes $$ unique word)
+    // MSB-first: send bits 7-6, then 5-4, then 3-2, then 1-0
     for (int i = 0; i < tx_len; i++) {
         uint8_t byte = tx_packet[i];
-        for (int b = 0; b < 4; b++) {
-            uint8_t symbol = (byte >> 6) & 0x03;
-            horus_tx_symbol(symbol);
-            byte <<= 2;
-        }
+        horus_tx_symbol((byte >> 6) & 0x03);
+        horus_tx_symbol((byte >> 4) & 0x03);
+        horus_tx_symbol((byte >> 2) & 0x03);
+        horus_tx_symbol(byte & 0x03);
     }
     
     // Stop 4FSK transmission
@@ -1176,8 +1133,9 @@ void init_radio(void) {
     
     set_bitrate(2400);
     
+    // PA config - standard power for RA-02 module
+    // 0x8F = PA_BOOST on, OutputPower=15 (max for PA_BOOST without +20dBm mode)
     sx_write(REG_PA_CONFIG, 0x8F);
-    sx_write(0x4D, 0x87);  // RegPaDac: Enable +20dBm high power mode
     sx_write(REG_PA_RAMP, 0x09);
     
     sx_write(REG_PREAMBLE_MSB, 0x00);
