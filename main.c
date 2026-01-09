@@ -1002,7 +1002,32 @@ static int build_horus_v2_encoded(uint8_t *output) {
     
     // Read core temperature
     float temp = read_core_temperature();
+    printf("Core temp: %.1f C (raw int8: %d)\n", temp, (int8_t)temp);
     horus_packet_data.temperature = (int8_t)temp;  // Truncate to integer
+    
+    // Log temperature to file for debugging
+    {
+        char log_buf[128];
+        int len = snprintf(log_buf, sizeof(log_buf), 
+            "pkt=%lu temp_float=%.2f temp_int8=%d vsys=%.2f batt=%d\n",
+            horus_packet_count, temp, (int8_t)temp, vsys, horus_packet_data.battery);
+        // Append to existing log or create new
+        uint32_t existing_size = 0;
+        const uint8_t* existing = msc_disk_find_file("templog.txt", &existing_size);
+        if (existing && existing_size < 4000) {
+            // Append by reading old + new
+            uint8_t combined[4096];
+            memcpy(combined, existing, existing_size);
+            memcpy(combined + existing_size, log_buf, len);
+            msc_disk_overwrite_file("templog.txt", combined, existing_size + len);
+        } else {
+            // Create new or replace if too big
+            msc_disk_create_file_if_missing("templog.txt", (const uint8_t*)log_buf, len);
+            if (existing_size >= 4000) {
+                msc_disk_overwrite_file("templog.txt", (const uint8_t*)log_buf, len);
+            }
+        }
+    }
     
     // Calculate CRC over first 30 bytes
     horus_packet_data.checksum = horus_crc16((uint8_t*)&horus_packet_data, 30);

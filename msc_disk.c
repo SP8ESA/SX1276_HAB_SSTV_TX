@@ -99,13 +99,60 @@ void msc_disk_format(void) {
     memcpy(root, "SSTV       ", 11);  // Volume label
     root[11] = 0x08;  // Attribute: volume label
     
-    // LBA 10-15 are data sectors (cluster 2-7)
+    // Create IMAGES subdirectory entry (second entry in root)
+    // Directory will be stored in cluster 2 (LBA 10)
+    uint8_t* images_entry = root + 32;  // Second directory entry
+    memcpy(images_entry, "IMAGES     ", 11);  // Directory name (8.3 format, no extension)
+    images_entry[11] = 0x10;  // Attribute: directory
+    images_entry[26] = 2;     // Start cluster: 2 (low byte)
+    images_entry[27] = 0;     // Start cluster: 2 (high byte)
+    // Size is 0 for directories
     
-    // Write second 4KB sector (LBA 8-15: FAT2 end + root + data start)
+    // LBA 10 is cluster 2 - will contain IMAGES directory entries
+    // Initialize with . and .. entries
+    uint8_t* images_dir = sector_buf + (2 * 512);  // LBA 10 = offset 1024 in this sector
+    
+    // "." entry (self-reference)
+    memcpy(images_dir, ".          ", 11);
+    images_dir[11] = 0x10;  // Directory
+    images_dir[26] = 2;     // Cluster 2
+    images_dir[27] = 0;
+    
+    // ".." entry (parent = root, cluster 0)
+    uint8_t* dotdot = images_dir + 32;
+    memcpy(dotdot, "..         ", 11);
+    dotdot[11] = 0x10;  // Directory
+    dotdot[26] = 0;     // Root directory = cluster 0
+    dotdot[27] = 0;
+    
+    // Rest of IMAGES directory is empty (zeros)
+    
+    // LBA 11-15 are data sectors (cluster 3-7)
+    
+    // Write second 4KB sector (LBA 8-15: FAT2 end + root + IMAGES dir + data)
     flush_sector(FLASH_SECTOR_SIZE);
     
+    // Now update FAT to mark cluster 2 as end-of-chain (0xFFF) for IMAGES directory
+    // Read back first flash sector (contains FAT1 and FAT2)
+    memcpy(sector_buf, flash_storage, FLASH_SECTOR_SIZE);
+    
+    // FAT1 at offset 512, cluster 2 is at byte offset (2*3/2) = 3
+    // Cluster 2 is even, so: byte[3] = low 8 bits, byte[4] low nibble = high 4 bits
+    uint8_t* fat1_c2 = sector_buf + 512 + 3;
+    fat1_c2[0] = 0xFF;  // Low 8 bits of 0xFFF
+    fat1_c2[1] = (fat1_c2[1] & 0xF0) | 0x0F;  // High 4 bits of 0xFFF
+    
+    // FAT2 at offset 2560
+    uint8_t* fat2_c2 = sector_buf + 2560 + 3;
+    fat2_c2[0] = 0xFF;
+    fat2_c2[1] = (fat2_c2[1] & 0xF0) | 0x0F;
+    
+    // Write back FAT sector
+    flush_sector(0);
+    
     printf("Format complete. 256KB disk ready.\n");
-    printf("  FAT12: 512 sectors, 502 data clusters available\n");
+    printf("  FAT12: 512 sectors, 501 data clusters available\n");
+    printf("  Created /IMAGES/ directory for JPEG files\n");
 }
 
 void msc_disk_init(void) {
@@ -148,27 +195,117 @@ static int ascii_casecmp(const char* a, const char* b) {
     return 0;
 }
 
-int msc_disk_list_jpegs(ImageEntry* out_entries, int max_entries) {
+// Helper: Find IMAGES directory cluster from root directory
+static uint16_t find_images_dir_cluster(void) {
     const uint8_t* root = flash_storage + (9 * DISK_BLOCK_SIZE);
-    int count = 0;
-    for (int i = 0; i < 16 && count < max_entries; i++) {
+    for (int i = 0; i < 16; i++) {
         const uint8_t* entry = root + (i * 32);
         if (entry[0] == 0x00 || entry[0] == 0xE5) continue;
-        if (entry[11] & 0x18) continue; // skip dirs/volume
+        if ((entry[11] & 0x10) == 0) continue;  // Not a directory
+        
+        // Check if name is "IMAGES     "
+        if (memcmp(entry, "IMAGES     ", 11) == 0) {
+            return entry[26] | (entry[27] << 8);
+        }
+    }
+    return 0;  // Not found
+}
 
-        char a = entry[8]; char b = entry[9]; char c = entry[10];
-        bool is_jpg = false;
-        if ((a=='J' || a=='j') && (b=='P' || b=='p') && (c=='G' || c=='g')) is_jpg = true;
-        if ((a=='J' || a=='j') && (b=='P' || b=='p') && (c=='E' || c=='e')) is_jpg = true; // .JPE
-        if (!is_jpg) continue;
+// List JPEG files from /IMAGES/ subdirectory
+// Subdirectory can have many more entries than root (limited only by cluster chain)
+int msc_disk_list_jpegs(ImageEntry* out_entries, int max_entries) {
+    // Find IMAGES directory
+    uint16_t images_cluster = find_images_dir_cluster();
+    
+    // Fallback: if no IMAGES dir, search root directory (backward compatibility)
+    if (images_cluster == 0) {
+        const uint8_t* root = flash_storage + (9 * DISK_BLOCK_SIZE);
+        int count = 0;
+        for (int i = 0; i < 16 && count < max_entries; i++) {
+            const uint8_t* entry = root + (i * 32);
+            if (entry[0] == 0x00 || entry[0] == 0xE5) continue;
+            if (entry[11] & 0x18) continue;
 
-        // Fill entry
-        ImageEntry ie;
-        make_name(entry, ie.name, sizeof(ie.name));
-        ie.cluster = entry[26] | (entry[27] << 8);
-        ie.size = entry[28] | (entry[29] << 8) | (entry[30] << 16) | (entry[31] << 24);
-        if (ie.cluster < 2) continue;
-        out_entries[count++] = ie;
+            char a = entry[8]; char b = entry[9]; char c = entry[10];
+            bool is_jpg = false;
+            if ((a=='J' || a=='j') && (b=='P' || b=='p') && (c=='G' || c=='g')) is_jpg = true;
+            if ((a=='J' || a=='j') && (b=='P' || b=='p') && (c=='E' || c=='e')) is_jpg = true;
+            if (!is_jpg) continue;
+
+            ImageEntry ie;
+            make_name(entry, ie.name, sizeof(ie.name));
+            ie.cluster = entry[26] | (entry[27] << 8);
+            ie.size = entry[28] | (entry[29] << 8) | (entry[30] << 16) | (entry[31] << 24);
+            if (ie.cluster < 2) continue;
+            out_entries[count++] = ie;
+        }
+        // Sort
+        for (int i = 0; i < count; i++) {
+            for (int j = i + 1; j < count; j++) {
+                if (ascii_casecmp(out_entries[i].name, out_entries[j].name) > 0) {
+                    ImageEntry tmp = out_entries[i];
+                    out_entries[i] = out_entries[j];
+                    out_entries[j] = tmp;
+                }
+            }
+        }
+        return count;
+    }
+    
+    // Read IMAGES directory from its cluster(s)
+    // For simplicity, assume directory fits in one cluster (16 entries per 512-byte cluster)
+    // But we follow the FAT chain to support larger directories
+    int count = 0;
+    uint16_t cluster = images_cluster;
+    
+    while (cluster >= 2 && cluster < 0xFF8 && count < max_entries) {
+        // Calculate sector for this cluster
+        uint32_t sector = 10 + (cluster - 2);
+        const uint8_t* dir_data = flash_storage + (sector * DISK_BLOCK_SIZE);
+        
+        // Each cluster has 16 directory entries (512 bytes / 32 bytes per entry)
+        for (int i = 0; i < 16 && count < max_entries; i++) {
+            const uint8_t* entry = dir_data + (i * 32);
+            
+            // End of directory
+            if (entry[0] == 0x00) {
+                cluster = 0xFFF;  // Stop scanning
+                break;
+            }
+            
+            // Deleted or special entry
+            if (entry[0] == 0xE5) continue;
+            if (entry[0] == '.') continue;  // Skip . and ..
+            if (entry[11] & 0x18) continue; // Skip subdirs and volume labels
+
+            // Check for JPEG extension
+            char a = entry[8]; char b = entry[9]; char c = entry[10];
+            bool is_jpg = false;
+            if ((a=='J' || a=='j') && (b=='P' || b=='p') && (c=='G' || c=='g')) is_jpg = true;
+            if ((a=='J' || a=='j') && (b=='P' || b=='p') && (c=='E' || c=='e')) is_jpg = true;
+            if (!is_jpg) continue;
+
+            // Fill entry
+            ImageEntry ie;
+            make_name(entry, ie.name, sizeof(ie.name));
+            ie.cluster = entry[26] | (entry[27] << 8);
+            ie.size = entry[28] | (entry[29] << 8) | (entry[30] << 16) | (entry[31] << 24);
+            if (ie.cluster < 2) continue;
+            out_entries[count++] = ie;
+        }
+        
+        // Follow FAT chain to next cluster
+        if (cluster < 0xFF8) {
+            const uint8_t* fat1 = flash_storage + (1 * 512);
+            uint32_t fat_offset = (cluster * 3) / 2;
+            uint16_t next;
+            if (cluster & 1) {
+                next = ((fat1[fat_offset] >> 4) & 0x0F) | (fat1[fat_offset + 1] << 4);
+            } else {
+                next = fat1[fat_offset] | ((fat1[fat_offset + 1] & 0x0F) << 8);
+            }
+            cluster = next;
+        }
     }
 
     // Sort alphabetically (case-insensitive)
