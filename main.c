@@ -1037,7 +1037,7 @@ static int build_horus_v2_encoded(uint8_t *output) {
 }
 
 // ============================================================================
-// TRUE 4FSK Transmission - Direct frequency control
+// 4FSK Transmission - Direct frequency control
 // ============================================================================
 
 // Set carrier frequency directly (for 4FSK)
@@ -1055,7 +1055,7 @@ static void horus_set_fdev(uint16_t fdev_hz) {
     sx_write(REG_FDEV_LSB, fdev & 0xFF);
 }
 
-// Setup radio for TRUE 4FSK - STDBY/TX switching (max power)
+// Setup radio for 4FSK - STDBY/TX switching (max power)
 static void horus_tx_start(void) {
     // Stop any current transmission
     tone_off();

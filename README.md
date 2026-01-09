@@ -14,7 +14,7 @@ SSTV (Slow Scan Television) image transmitter with integrated Horus Binary v2 4F
 - **JPEG Support** - Automatic JPEG decoding with scaling
 - **Multiple Images** - Cycles through all JPEG files alphabetically
 - **Two SSTV Modes** - Robot36 (36s) and PD120 (126s)
-- **Horus v2 Telemetry** - TRUE 4FSK telemetry (real RF frequency shifting)
+- **Horus v2 Telemetry** - 4FSK telemetry for position tracking
 - **GPS Integration** - ATGM336H GPS module support
 - **Image Overlay** - Callsign, label, and image counter on transmitted images
 - **Configuration File** - Easy setup via config.txt
@@ -168,10 +168,10 @@ Font size can be adjusted with `sstv_font_size` (1=small, 4=large).
 
 ### Horus Binary v2 Telemetry
 
-The transmitter supports **Horus Binary v2** TRUE 4FSK telemetry. When enabled, telemetry packets are transmitted before each SSTV image on a separate frequency.
+The transmitter supports **Horus Binary v2** 4FSK telemetry. When enabled, telemetry packets are transmitted before each SSTV image on a separate frequency.
 
 **Horus v2 Specifications:**
-- 100 baud TRUE 4FSK (real RF frequency shifting, not AFSK)
+- 100 baud 4FSK (direct RF frequency shifting)
 - 270 Hz tone spacing
 - Golay FEC for error correction
 - +1200 Hz audio offset for USB reception
@@ -234,7 +234,7 @@ ffmpeg -i input.jpg -pix_fmt yuvj420p output.jpg
 | Parameter | Value |
 |-----------|-------|
 | SSTV Modulation | FM (1200-2300 Hz audio) |
-| Horus Modulation | TRUE 4FSK (270 Hz spacing) |
+| Horus Modulation | 4FSK (270 Hz spacing) |
 | Output power | +20 dBm (100 mW) max |
 | Frequency accuracy | Depends on crystal + PPM correction |
 | Image buffer | 320×240 YCbCr |

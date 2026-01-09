@@ -119,7 +119,7 @@ uint32_t frf = (uint32_t)(corrected_freq / FSTEP_HZ);  // FSTEP_HZ = 61.035
 
 ### Horus v2 Telemetry
 
-- TRUE 4FSK (direct RF frequency shifting, not AFSK)
+- 4FSK (direct RF frequency shifting)
 - 100 baud, 270 Hz tone spacing
 - +1200 Hz USB offset (for SDR reception)
 - Golay (23,12) FEC with interleaving and scrambling
