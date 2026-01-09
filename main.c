@@ -76,7 +76,9 @@ void init_radio(void);
 #define FSTEP_HZ      61.035f
 
 // Runtime config (can be overridden from config.txt)
-static uint32_t base_freq_hz = BASE_FREQ_HZ;
+static uint32_t sstv_freq_hz = 433400000UL;   // SSTV frequency (default 433.400 MHz)
+static uint32_t horus_freq_hz = 437600000UL;  // Horus frequency (default 437.600 MHz)
+static uint32_t base_freq_hz = 433400000UL;   // Current active frequency
 static float ppm_correction = 0.0f;
 static uint32_t tx_interval_sec = 3;
 
@@ -87,15 +89,27 @@ typedef enum {
 } sstv_mode_t;
 static sstv_mode_t sstv_mode = SSTV_ROBOT36;
 
+// SSTV overlay settings
+static char sstv_callsign[12] = "N0CALL";     // Callsign top-left
+static char sstv_label[32] = "";               // Label bottom-left (default empty)
+static int sstv_font_size = 2;                 // Font scale (1-4)
+static bool sstv_counter_enabled = true;       // Show image counter (e.g. "3/12")
+
+// Image counter for numbering overlay
+static int current_image_num = 0;
+static int total_image_count = 0;
+
 // ============================================================================
 // HORUS BINARY v2 - 4FSK Telemetry (TRUE RF 4FSK, not AFSK)
 // ============================================================================
 // 100 baud, 4FSK, 270 Hz shift between tones
 // Direct frequency shifting for SDR reception
+// Audio offset: lowest tone at +1200Hz from dial frequency for USB reception
 
 #define HORUS_BAUD_RATE    100      // 100 symbols/sec
 #define HORUS_TONE_SPACING 270      // Hz between tones (standard Horus)
 #define HORUS_SYMBOL_US    10000    // 1/100 baud = 10ms per symbol
+#define HORUS_AUDIO_OFFSET 1200     // Hz offset for USB reception (lowest tone)
 
 // Horus v2 configuration
 static bool horus_enabled = false;
@@ -133,6 +147,155 @@ void rgb_to_ycbcr(uint8_t r, uint8_t g, uint8_t b, uint8_t* y, uint8_t* cb, uint
     *y  = (Y  < 0) ? 0 : (Y  > 255) ? 255 : Y;
     *cb = (Cb < 0) ? 0 : (Cb > 255) ? 255 : Cb;
     *cr = (Cr < 0) ? 0 : (Cr > 255) ? 255 : Cr;
+}
+
+// ============================================================================
+// Simple 5x7 font for callsign overlay
+// ============================================================================
+static const uint8_t font5x7[][5] = {
+    // Space (32)
+    {0x00, 0x00, 0x00, 0x00, 0x00},
+    // ! to / (33-47) - simplified, only need letters and numbers
+    {0x00, 0x00, 0x5F, 0x00, 0x00}, // !
+    {0x00, 0x07, 0x00, 0x07, 0x00}, // "
+    {0x14, 0x7F, 0x14, 0x7F, 0x14}, // #
+    {0x24, 0x2A, 0x7F, 0x2A, 0x12}, // $
+    {0x23, 0x13, 0x08, 0x64, 0x62}, // %
+    {0x36, 0x49, 0x55, 0x22, 0x50}, // &
+    {0x00, 0x05, 0x03, 0x00, 0x00}, // '
+    {0x00, 0x1C, 0x22, 0x41, 0x00}, // (
+    {0x00, 0x41, 0x22, 0x1C, 0x00}, // )
+    {0x14, 0x08, 0x3E, 0x08, 0x14}, // *
+    {0x08, 0x08, 0x3E, 0x08, 0x08}, // +
+    {0x00, 0x50, 0x30, 0x00, 0x00}, // ,
+    {0x08, 0x08, 0x08, 0x08, 0x08}, // -
+    {0x00, 0x60, 0x60, 0x00, 0x00}, // .
+    {0x20, 0x10, 0x08, 0x04, 0x02}, // /
+    // 0-9 (48-57)
+    {0x3E, 0x51, 0x49, 0x45, 0x3E}, // 0
+    {0x00, 0x42, 0x7F, 0x40, 0x00}, // 1
+    {0x42, 0x61, 0x51, 0x49, 0x46}, // 2
+    {0x21, 0x41, 0x45, 0x4B, 0x31}, // 3
+    {0x18, 0x14, 0x12, 0x7F, 0x10}, // 4
+    {0x27, 0x45, 0x45, 0x45, 0x39}, // 5
+    {0x3C, 0x4A, 0x49, 0x49, 0x30}, // 6
+    {0x01, 0x71, 0x09, 0x05, 0x03}, // 7
+    {0x36, 0x49, 0x49, 0x49, 0x36}, // 8
+    {0x06, 0x49, 0x49, 0x29, 0x1E}, // 9
+    // : to @ (58-64)
+    {0x00, 0x36, 0x36, 0x00, 0x00}, // :
+    {0x00, 0x56, 0x36, 0x00, 0x00}, // ;
+    {0x08, 0x14, 0x22, 0x41, 0x00}, // <
+    {0x14, 0x14, 0x14, 0x14, 0x14}, // =
+    {0x00, 0x41, 0x22, 0x14, 0x08}, // >
+    {0x02, 0x01, 0x51, 0x09, 0x06}, // ?
+    {0x32, 0x49, 0x79, 0x41, 0x3E}, // @
+    // A-Z (65-90)
+    {0x7E, 0x11, 0x11, 0x11, 0x7E}, // A
+    {0x7F, 0x49, 0x49, 0x49, 0x36}, // B
+    {0x3E, 0x41, 0x41, 0x41, 0x22}, // C
+    {0x7F, 0x41, 0x41, 0x22, 0x1C}, // D
+    {0x7F, 0x49, 0x49, 0x49, 0x41}, // E
+    {0x7F, 0x09, 0x09, 0x09, 0x01}, // F
+    {0x3E, 0x41, 0x49, 0x49, 0x7A}, // G
+    {0x7F, 0x08, 0x08, 0x08, 0x7F}, // H
+    {0x00, 0x41, 0x7F, 0x41, 0x00}, // I
+    {0x20, 0x40, 0x41, 0x3F, 0x01}, // J
+    {0x7F, 0x08, 0x14, 0x22, 0x41}, // K
+    {0x7F, 0x40, 0x40, 0x40, 0x40}, // L
+    {0x7F, 0x02, 0x0C, 0x02, 0x7F}, // M
+    {0x7F, 0x04, 0x08, 0x10, 0x7F}, // N
+    {0x3E, 0x41, 0x41, 0x41, 0x3E}, // O
+    {0x7F, 0x09, 0x09, 0x09, 0x06}, // P
+    {0x3E, 0x41, 0x51, 0x21, 0x5E}, // Q
+    {0x7F, 0x09, 0x19, 0x29, 0x46}, // R
+    {0x46, 0x49, 0x49, 0x49, 0x31}, // S
+    {0x01, 0x01, 0x7F, 0x01, 0x01}, // T
+    {0x3F, 0x40, 0x40, 0x40, 0x3F}, // U
+    {0x1F, 0x20, 0x40, 0x20, 0x1F}, // V
+    {0x3F, 0x40, 0x38, 0x40, 0x3F}, // W
+    {0x63, 0x14, 0x08, 0x14, 0x63}, // X
+    {0x07, 0x08, 0x70, 0x08, 0x07}, // Y
+    {0x61, 0x51, 0x49, 0x45, 0x43}, // Z
+};
+
+// Draw a character at position (x, y) in the Y buffer (black = Y=16)
+static void draw_char(int x, int y, char c, int scale) {
+    int idx;
+    if (c >= ' ' && c <= 'Z') {
+        idx = c - ' ';
+    } else if (c >= 'a' && c <= 'z') {
+        idx = c - 'a' + ('A' - ' ');  // Convert to uppercase
+    } else {
+        return;  // Unsupported character
+    }
+    
+    if (idx < 0 || idx >= (int)(sizeof(font5x7)/sizeof(font5x7[0]))) return;
+    
+    const uint8_t* glyph = font5x7[idx];
+    
+    for (int col = 0; col < 5; col++) {
+        uint8_t bits = glyph[col];
+        for (int row = 0; row < 7; row++) {
+            if (bits & (1 << row)) {
+                // Draw scaled pixel (black = Y=16, neutral chroma)
+                for (int sy = 0; sy < scale; sy++) {
+                    for (int sx = 0; sx < scale; sx++) {
+                        int px = x + col * scale + sx;
+                        int py = y + row * scale + sy;
+                        if (px >= 0 && px < IMG_WIDTH && py >= 0 && py < IMG_HEIGHT) {
+                            image_Y[py][px] = 16;      // Black
+                            image_RY[py][px] = 128;    // Neutral
+                            image_BY[py][px] = 128;    // Neutral
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Draw text string at (x, y) with given scale
+static void draw_text(int x, int y, const char* str, int scale) {
+    int char_width = 6 * scale;  // 5 pixels + 1 space
+    for (int i = 0; str[i] != '\0'; i++) {
+        draw_char(x + i * char_width, y, str[i], scale);
+    }
+}
+
+// Get text width in pixels
+static int text_width(const char* str, int scale) {
+    int len = 0;
+    while (str[len]) len++;
+    return len * 6 * scale;
+}
+
+// Overlay all texts on loaded image
+static void overlay_texts(void) {
+    int scale = sstv_font_size;
+    if (scale < 1) scale = 1;
+    if (scale > 4) scale = 4;
+    
+    int char_height = 7 * scale;
+    int margin = 4;
+    
+    // Callsign - top-left
+    if (sstv_callsign[0] != '\0') {
+        draw_text(margin, margin, sstv_callsign, scale);
+    }
+    
+    // Image counter - top-right (e.g. "3/12") - only if enabled and multiple images
+    if (sstv_counter_enabled && total_image_count > 0) {
+        char counter[16];
+        snprintf(counter, sizeof(counter), "%d/%d", current_image_num, total_image_count);
+        int w = text_width(counter, scale);
+        draw_text(IMG_WIDTH - w - margin, margin, counter, scale);
+    }
+    
+    // Label - bottom-left
+    if (sstv_label[0] != '\0') {
+        draw_text(margin, IMG_HEIGHT - char_height - margin, sstv_label, scale);
+    }
 }
 
 // Load BMP into YCbCr buffers with scaling to 320x240 if needed
@@ -863,7 +1026,7 @@ static void horus_set_fdev(uint16_t fdev_hz) {
     sx_write(REG_FDEV_LSB, fdev & 0xFF);
 }
 
-// Setup radio for TRUE 4FSK - STDBY/TX switching (good power)
+// Setup radio for TRUE 4FSK - STDBY/TX switching (max power)
 static void horus_tx_start(void) {
     // Stop any current transmission
     tone_off();
@@ -876,17 +1039,20 @@ static void horus_tx_start(void) {
     sx_write(REG_OP_MODE, 0x01);
     sleep_ms(1);
     
-    // PA config - same as init_radio
-    sx_write(REG_PA_CONFIG, 0x8F);
+    // PA config - MAXIMUM POWER +20dBm
+    sx_write(REG_PA_CONFIG, 0xFF);  // PA_BOOST, max output power
+    sx_write(0x4D, 0x87);           // RegPaDac: +20dBm high power mode
     sx_write(REG_PA_RAMP, 0x09);
     
     // Zero deviation - pure carrier
     sx_write(REG_FDEV_MSB, 0x00);
     sx_write(REG_FDEV_LSB, 0x00);
     
-    // Set initial frequency
-    double corrected_freq = (double)base_freq_hz * (1.0 + ppm_correction / 1000000.0);
-    horus_set_freq((uint32_t)corrected_freq);
+    // Set Horus frequency with USB offset
+    // This puts the lowest tone (symbol 0) at horus_freq + 1200Hz
+    // So USB receiver tuned to horus_freq hears tones at 1200-2010Hz audio range
+    double corrected_freq = (double)horus_freq_hz * (1.0 + ppm_correction / 1000000.0);
+    horus_set_freq((uint32_t)(corrected_freq + HORUS_AUDIO_OFFSET));
 }
 
 // Stop 4FSK and restore FM mode for SSTV  
@@ -901,12 +1067,13 @@ static void horus_tx_stop(void) {
 
 // Transmit single 4FSK symbol - wait for mode ready, compensate timing
 // Symbol 0 = base (lowest), 1 = +270Hz, 2 = +540Hz, 3 = +810Hz (highest)
+// With USB offset: symbol 0 at +1200Hz, symbol 3 at +2010Hz from carrier
 __attribute__((noinline)) static void horus_tx_symbol(uint8_t symbol) {
     uint32_t start_time = time_us_32();
     
-    // Calculate frequency for this symbol
-    uint32_t base = (uint32_t)((double)base_freq_hz * (1.0 + ppm_correction / 1000000.0));
-    uint32_t freq = base + (symbol & 0x03) * HORUS_TONE_SPACING;
+    // Calculate frequency for this symbol (using Horus frequency + USB offset)
+    uint32_t base = (uint32_t)((double)horus_freq_hz * (1.0 + ppm_correction / 1000000.0));
+    uint32_t freq = base + HORUS_AUDIO_OFFSET + (symbol & 0x03) * HORUS_TONE_SPACING;
     uint32_t frf = (uint32_t)((double)freq / FSTEP_HZ);
     
     // STDBY and wait for mode ready
@@ -932,38 +1099,11 @@ __attribute__((noinline)) static void horus_tx_symbol(uint8_t symbol) {
 // Send complete Horus v2 telemetry frame
 
 void send_horus_telemetry(void) {
-    // STATIC buffers to avoid stack issues
+    // STATIC buffer for encoded packet
     static uint8_t tx_packet[72];
-    static uint8_t raw_copy[32];  // Copy of raw data before encoding
-    static char log_buf[512];
-    static const char hex[] = "0123456789ABCDEF";
-    
-    // Copy raw payload BEFORE encoding (in case encoder modifies it)
-    memcpy(raw_copy, (uint8_t*)&horus_packet_data, 32);
     
     // Encode packet
     int tx_len = build_horus_v2_encoded(tx_packet);
-    
-    // Build debug log: R=raw, E=final encoded
-    char* p = log_buf;
-    
-    // RAW (32 bytes = 64 hex chars)
-    *p++ = 'R'; *p++ = ':';
-    for (int i = 0; i < 32; i++) {
-        *p++ = hex[raw_copy[i] >> 4];
-        *p++ = hex[raw_copy[i] & 0xF];
-    }
-    *p++ = '\n';
-    
-    // ENC final - full encoded packet
-    *p++ = 'E'; *p++ = ':';
-    for (int i = 0; i < tx_len; i++) {
-        *p++ = hex[tx_packet[i] >> 4];
-        *p++ = hex[tx_packet[i] & 0xF];
-    }
-    *p++ = '\n';
-    
-    msc_disk_overwrite_file("HORUS.TXT", (const uint8_t*)log_buf, p - log_buf);
     
     // Start 4FSK transmission (direct carrier frequency control)
     horus_tx_start();
@@ -1116,14 +1256,14 @@ void init_radio(void) {
     sx_write(REG_OP_MODE, 0x00);
     sleep_ms(10);
     
-    // Apply PPM correction to frequency
-    double corrected_freq = (double)base_freq_hz * (1.0 + ppm_correction / 1000000.0);
+    // Apply PPM correction to SSTV frequency
+    double corrected_freq = (double)sstv_freq_hz * (1.0 + ppm_correction / 1000000.0);
     uint32_t frf = (uint32_t)(corrected_freq / FSTEP_HZ);
     sx_write(REG_FRF_MSB, (frf >> 16) & 0xFF);
     sx_write(REG_FRF_MID, (frf >> 8) & 0xFF);
     sx_write(REG_FRF_LSB, frf & 0xFF);
     
-    printf("Freq: %.3f MHz (PPM: %.1f)\n", corrected_freq / 1000000.0, ppm_correction);
+    printf("SSTV Freq: %.3f MHz (PPM: %.1f)\n", corrected_freq / 1000000.0, ppm_correction);
     
     // FM deviation
     uint16_t fdev = (uint16_t)(FM_DEVIATION_HZ / FSTEP_HZ);
@@ -1133,9 +1273,9 @@ void init_radio(void) {
     
     set_bitrate(2400);
     
-    // PA config - standard power for RA-02 module
-    // 0x8F = PA_BOOST on, OutputPower=15 (max for PA_BOOST without +20dBm mode)
-    sx_write(REG_PA_CONFIG, 0x8F);
+    // PA config - MAXIMUM POWER +20dBm for RA-02 module
+    sx_write(REG_PA_CONFIG, 0xFF);  // PA_BOOST, max output power
+    sx_write(0x4D, 0x87);           // RegPaDac: +20dBm high power mode
     sx_write(REG_PA_RAMP, 0x09);
     
     sx_write(REG_PREAMBLE_MSB, 0x00);
@@ -1368,7 +1508,7 @@ int main(void) {
         printf("GP5 grounded - forcing flash format...\n");
         msc_disk_format();
         const char* cfg_name_fmt = "config.txt";
-        const char* default_cfg_fmt = "freq=434.500\nppm=0.0\ninterval=3\nmode=robot36\nhorus=0\nhorus_id=256\nhorus_count=1\n";
+        const char* default_cfg_fmt = "sstv_freq=433.400\nhorus_freq=437.600\nppm=0.0\ninterval=3\nmode=robot36\nhorus=1\nhorus_id=256\nhorus_count=1\nsstv_callsign=N0CALL\nsstv_label=\nsstv_font_size=2\nsstv_counter=1\n";
         msc_disk_create_file_if_missing(cfg_name_fmt, (const uint8_t*)default_cfg_fmt, strlen(default_cfg_fmt));
         printf("Format complete. Remove GP5 jumper and reset.\n");
     }
@@ -1391,21 +1531,16 @@ int main(void) {
 
     // Ensure config file exists; create with default if missing
     const char* cfg_name = "config.txt";
-    const char* default_cfg = "freq=434.500\nppm=0.0\ninterval=3\nmode=robot36\nhorus=0\nhorus_id=256\nhorus_count=1\n";
+    const char* default_cfg = "sstv_freq=433.400\nhorus_freq=437.600\nppm=0.0\ninterval=3\nmode=robot36\nhorus=1\nhorus_id=256\nhorus_count=1\nsstv_callsign=N0CALL\nsstv_label=\nsstv_font_size=2\nsstv_counter=1\n";
     if (msc_disk_create_file_if_missing(cfg_name, (const uint8_t*)default_cfg, strlen(default_cfg))) {
-    
-    // Create HORUS.TXT for debug output (512 bytes for full packet dump)
-    char horus_init[512];
-    memset(horus_init, '.', 511);
-    horus_init[511] = '\n';
-    msc_disk_create_file_if_missing("HORUS.TXT", (const uint8_t*)horus_init, 512);
     
         uint32_t cfg_size;
         const uint8_t* cfg_data = msc_disk_find_file(cfg_name, &cfg_size);
         if (cfg_data && cfg_size > 0) {
-            // Parse config: freq=xxx.xxx, ppm=x.x, interval=x, mode=robot36|pd120, horus=0|1, horus_id=N, horus_count=N
+            // Parse config
             bool config_valid = false;
-            float freq_mhz = 0.0f;
+            float sstv_freq_mhz = 433.400f;
+            float horus_freq_mhz = 437.600f;
             float ppm_val = 0.0f;
             uint32_t interval_val = 3;
             sstv_mode_t mode_val = SSTV_ROBOT36;
@@ -1421,10 +1556,10 @@ int main(void) {
                 while (p < end && (*p == ' ' || *p == '\t')) p++;
                 if (p >= end) break;
                 
-                // Check for freq=
-                if (strncmp(p, "freq=", 5) == 0) {
-                    p += 5;
-                    freq_mhz = 0.0f;
+                // Check for sstv_freq=
+                if (strncmp(p, "sstv_freq=", 10) == 0) {
+                    p += 10;
+                    sstv_freq_mhz = 0.0f;
                     float decimal = 0.0f;
                     float decimal_div = 1.0f;
                     bool in_decimal = false;
@@ -1434,17 +1569,39 @@ int main(void) {
                                 decimal_div *= 10.0f;
                                 decimal += (*p - '0') / decimal_div;
                             } else {
-                                freq_mhz = freq_mhz * 10.0f + (*p - '0');
+                                sstv_freq_mhz = sstv_freq_mhz * 10.0f + (*p - '0');
                             }
                         } else if (*p == '.') {
                             in_decimal = true;
                         }
                         p++;
                     }
-                    freq_mhz += decimal;
-                    if (freq_mhz >= 1.0f && freq_mhz <= 1000.0f) {
+                    sstv_freq_mhz += decimal;
+                    if (sstv_freq_mhz >= 1.0f && sstv_freq_mhz <= 1000.0f) {
                         config_valid = true;
                     }
+                }
+                // Check for horus_freq=
+                else if (strncmp(p, "horus_freq=", 11) == 0) {
+                    p += 11;
+                    horus_freq_mhz = 0.0f;
+                    float decimal = 0.0f;
+                    float decimal_div = 1.0f;
+                    bool in_decimal = false;
+                    while (p < end && *p != '\n' && *p != '\r') {
+                        if (*p >= '0' && *p <= '9') {
+                            if (in_decimal) {
+                                decimal_div *= 10.0f;
+                                decimal += (*p - '0') / decimal_div;
+                            } else {
+                                horus_freq_mhz = horus_freq_mhz * 10.0f + (*p - '0');
+                            }
+                        } else if (*p == '.') {
+                            in_decimal = true;
+                        }
+                        p++;
+                    }
+                    horus_freq_mhz += decimal;
                 }
                 // Check for ppm=
                 else if (strncmp(p, "ppm=", 4) == 0) {
@@ -1526,23 +1683,65 @@ int main(void) {
                     if (horus_count_val < 1) horus_count_val = 1;
                     if (horus_count_val > 10) horus_count_val = 10;
                 }
+                // Check for sstv_callsign=
+                else if (strncmp(p, "sstv_callsign=", 14) == 0) {
+                    p += 14;
+                    int i = 0;
+                    while (p < end && *p != '\n' && *p != '\r' && i < 11) {
+                        sstv_callsign[i++] = *p++;
+                    }
+                    sstv_callsign[i] = '\0';
+                    // Skip rest of line if any
+                    while (p < end && *p != '\n' && *p != '\r') p++;
+                }
+                // Check for sstv_label=
+                else if (strncmp(p, "sstv_label=", 11) == 0) {
+                    p += 11;
+                    int i = 0;
+                    while (p < end && *p != '\n' && *p != '\r' && i < 31) {
+                        sstv_label[i++] = *p++;
+                    }
+                    sstv_label[i] = '\0';
+                }
+                // Check for sstv_font_size=
+                else if (strncmp(p, "sstv_font_size=", 15) == 0) {
+                    p += 15;
+                    sstv_font_size = 0;
+                    while (p < end && *p != '\n' && *p != '\r') {
+                        if (*p >= '0' && *p <= '9') {
+                            sstv_font_size = sstv_font_size * 10 + (*p - '0');
+                        }
+                        p++;
+                    }
+                    if (sstv_font_size < 1) sstv_font_size = 1;
+                    if (sstv_font_size > 4) sstv_font_size = 4;
+                }
+                // Check for sstv_counter= (0 or 1)
+                else if (strncmp(p, "sstv_counter=", 13) == 0) {
+                    p += 13;
+                    sstv_counter_enabled = (*p == '1');
+                    while (p < end && *p != '\n' && *p != '\r') p++;
+                }
                 
                 // Skip to next line
                 while (p < end && *p != '\n') p++;
                 if (p < end) p++;
             }
 
-            if (config_valid && freq_mhz >= 1.0f && freq_mhz <= 1000.0f) {
-                base_freq_hz = (uint32_t)(freq_mhz * 1000000.0f);
+            if (config_valid) {
+                sstv_freq_hz = (uint32_t)(sstv_freq_mhz * 1000000.0f);
+                horus_freq_hz = (uint32_t)(horus_freq_mhz * 1000000.0f);
                 ppm_correction = ppm_val;
                 tx_interval_sec = interval_val;
                 sstv_mode = mode_val;
                 horus_enabled = horus_val;
                 horus_payload_id = horus_id_val;
                 horus_tx_count = horus_count_val;
-                printf("Config OK: freq=%.3f MHz, ppm=%.1f, interval=%lu s, mode=%s\n", 
-                       freq_mhz, ppm_correction, tx_interval_sec,
+                printf("Config OK: SSTV=%.3f MHz, Horus=%.3f MHz, ppm=%.1f, interval=%lu s, mode=%s\n", 
+                       sstv_freq_mhz, horus_freq_mhz, ppm_correction, tx_interval_sec,
                        sstv_mode == SSTV_PD120 ? "PD120" : "Robot36");
+                printf("Callsign: %s, Label: %s, Font: %d\n", sstv_callsign, 
+                       sstv_label[0] ? sstv_label : "(none)", sstv_font_size);
                 if (horus_enabled) {
                     printf("Horus v2 ENABLED: ID=%u, %lu packets/cycle\n", 
                            horus_payload_id, horus_tx_count);
@@ -1555,7 +1754,11 @@ int main(void) {
                 ppm_correction = 0.0f;
                 tx_interval_sec = 3;
                 sstv_mode = SSTV_ROBOT36;
-                horus_enabled = false;
+                horus_enabled = true;
+                strcpy(sstv_callsign, "N0CALL");
+                sstv_label[0] = '\0';
+                sstv_font_size = 2;
+                sstv_counter_enabled = true;
             }
         }
     }
@@ -1580,30 +1783,6 @@ int main(void) {
     
     init_radio();
     generate_test_image();  // default test pattern
-    
-    // ========================================
-    // HORUS TEST MODE - nadaj 5 pakietów na start
-    // ========================================
-    printf("\n*** HORUS TEST MODE ***\n");
-    printf("Sending 5 Horus packets for testing...\n");
-    for (int test_pkt = 0; test_pkt < 5; test_pkt++) {
-        printf("\n--- Test packet %d/5 ---\n", test_pkt + 1);
-        
-        // Process GPS data before sending
-        gps_process();
-        
-        send_horus_telemetry();
-        
-        // 3 second pause between packets
-        printf("Waiting 3s...\n");
-        for (int d = 0; d < 300; d++) {
-            tud_task();
-            gps_process();
-            sleep_ms(10);
-        }
-    }
-    printf("*** HORUS TEST COMPLETE ***\n\n");
-    // ========================================
     
     printf("Waiting for BMP file...\n");
     
@@ -1729,13 +1908,18 @@ int main(void) {
 
                         // Recreate config.txt with default and reset config values
                         const char* cfg_name2 = "config.txt";
-                        const char* default_cfg2 = "freq=434.500\nppm=0.0\ninterval=3\nmode=robot36\nhorus=0\nhorus_id=256\nhorus_count=1\n";
+                        const char* default_cfg2 = "sstv_freq=433.400\nhorus_freq=437.600\nppm=0.0\ninterval=3\nmode=robot36\nhorus=1\nhorus_id=256\nhorus_count=1\nsstv_callsign=N0CALL\nsstv_label=\nsstv_font_size=2\nsstv_counter=1\n";
                         msc_disk_create_file_if_missing(cfg_name2, (const uint8_t*)default_cfg2, strlen(default_cfg2));
-                        base_freq_hz = BASE_FREQ_HZ;
+                        sstv_freq_hz = 433400000UL;
+                        horus_freq_hz = 437600000UL;
                         ppm_correction = 0.0f;
                         tx_interval_sec = 3;
                         sstv_mode = SSTV_ROBOT36;
-                        horus_enabled = false;
+                        horus_enabled = true;
+                        strcpy(sstv_callsign, "N0CALL");
+                        sstv_label[0] = '\0';
+                        sstv_font_size = 2;
+                        sstv_counter_enabled = true;
                         printf("Format complete; default config restored.\n");
                     }
                 }
@@ -1774,6 +1958,12 @@ int main(void) {
             
             printf("\n=== TX START (file %d/%d: %s) ===\n", curr_img_idx + 1, img_count > 0 ? img_count : 1,
                    img_count > 0 ? img_list[curr_img_idx].name : "test");
+            
+            // Update image counter and overlay texts before transmission
+            current_image_num = curr_img_idx + 1;
+            total_image_count = img_count > 0 ? img_count : 0;
+            overlay_texts();
+            
             send_sstv_image();
             printf("TX done. Next TX in %lu s...\n", tx_interval_sec);
             
