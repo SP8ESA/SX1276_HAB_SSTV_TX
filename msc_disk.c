@@ -42,58 +42,70 @@ static bool needs_format(void) {
 }
 
 // Format the flash filesystem
+// FAT12 layout for 512 sectors (256KB):
+// - Sector 0: Boot sector
+// - Sectors 1-4: FAT1 (4 sectors)
+// - Sectors 5-8: FAT2 (4 sectors)
+// - Sector 9: Root directory (16 entries = 512 bytes)
+// - Sectors 10-511: Data area (502 clusters, cluster 2 = sector 10)
 void msc_disk_format(void) {
     printf("Formatting flash disk...\n");
     
-    // Prepare boot sector
+    // === FLASH SECTOR 0 (LBA 0-7) ===
     memset(sector_buf, 0, FLASH_SECTOR_SIZE);
     
+    // Boot sector at LBA 0
     uint8_t* boot = sector_buf;
-    boot[0] = 0xEB; boot[1] = 0x3C; boot[2] = 0x90;  // Jump
-    memcpy(&boot[3], "MSDOS5.0", 8);                  // OEM
+    boot[0] = 0xEB; boot[1] = 0x3C; boot[2] = 0x90;  // Jump instruction
+    memcpy(&boot[3], "MSDOS5.0", 8);                  // OEM name
     boot[11] = 0x00; boot[12] = 0x02;                 // Bytes per sector: 512
-    boot[13] = 1;                                      // Sectors per cluster
-    boot[14] = 1; boot[15] = 0;                       // Reserved sectors
-    boot[16] = 2;                                      // Number of FATs
+    boot[13] = 1;                                      // Sectors per cluster: 1
+    boot[14] = 1; boot[15] = 0;                       // Reserved sectors: 1
+    boot[16] = 2;                                      // Number of FATs: 2
     boot[17] = 0x10; boot[18] = 0x00;                 // Root entries: 16
     boot[19] = 0x00; boot[20] = 0x02;                 // Total sectors: 512
     boot[21] = 0xF8;                                   // Media type: fixed disk
     boot[22] = 4; boot[23] = 0;                       // Sectors per FAT: 4
-    boot[24] = 1; boot[25] = 0;                       // Sectors per track
-    boot[26] = 1; boot[27] = 0;                       // Heads
-    boot[510] = 0x55; boot[511] = 0xAA;               // Signature
+    boot[24] = 1; boot[25] = 0;                       // Sectors per track: 1
+    boot[26] = 1; boot[27] = 0;                       // Heads: 1
+    boot[28] = 0; boot[29] = 0; boot[30] = 0; boot[31] = 0; // Hidden sectors: 0
+    boot[510] = 0x55; boot[511] = 0xAA;               // Boot signature
     
-    // FAT1 at sector 1
-    uint8_t* fat1 = sector_buf + 512;
-    fat1[0] = 0xF8;
-    fat1[1] = 0xFF;
-    fat1[2] = 0xFF;
+    // FAT1 starts at LBA 1 (offset 512 in this 4KB sector)
+    // FAT12 initial entries: F8 FF FF (media descriptor + cluster 0/1 reserved)
+    uint8_t* fat1 = sector_buf + (1 * 512);  // LBA 1
+    fat1[0] = 0xF8;  // Media descriptor
+    fat1[1] = 0xFF;  // Cluster 0 reserved (low nibble) + cluster 1 reserved (high nibble)
+    fat1[2] = 0xFF;  // Cluster 1 reserved cont.
+    // Rest of FAT1 is 0x00 (free clusters)
     
-    // Write first 4KB sector (boot + FAT1 start)
-    flush_sector(0);
-    
-    // FAT2 at sector 5 + root directory at sector 9
-    memset(sector_buf, 0, FLASH_SECTOR_SIZE);
-    
-    // FAT2 at offset 0 in this sector (sector 4-7 in second 4KB)
-    uint8_t* fat2 = sector_buf + 512;  // sector 5
+    // FAT1 continues in LBA 2,3,4 (all zeros = free)
+    // FAT2 starts at LBA 5 (offset 2560 in this 4KB sector)
+    uint8_t* fat2 = sector_buf + (5 * 512);  // LBA 5
     fat2[0] = 0xF8;
     fat2[1] = 0xFF;
     fat2[2] = 0xFF;
+    // FAT2 continues in LBA 6,7 (remaining in this sector, all zeros)
     
-    // Write second 4KB sector
+    // Write first 4KB sector (LBA 0-7: boot + FAT1 + FAT2 start)
+    flush_sector(0);
+    
+    // === FLASH SECTOR 1 (LBA 8-15) ===
+    memset(sector_buf, 0, FLASH_SECTOR_SIZE);
+    
+    // LBA 8 is last sector of FAT2 (zeros = free)
+    // LBA 9 is root directory
+    uint8_t* root = sector_buf + (1 * 512);  // LBA 9 = offset 512 in this sector
+    memcpy(root, "SSTV       ", 11);  // Volume label
+    root[11] = 0x08;  // Attribute: volume label
+    
+    // LBA 10-15 are data sectors (cluster 2-7)
+    
+    // Write second 4KB sector (LBA 8-15: FAT2 end + root + data start)
     flush_sector(FLASH_SECTOR_SIZE);
     
-    // Root directory at sector 9
-    memset(sector_buf, 0, FLASH_SECTOR_SIZE);
-    uint8_t* root = sector_buf + 512;  // sector 9 in third 4KB (sectors 8-11)
-    memcpy(root, "SSTV       ", 11);
-    root[11] = 0x08;  // Volume label
-    
-    // Write third 4KB sector
-    flush_sector(2 * FLASH_SECTOR_SIZE);
-    
     printf("Format complete. 256KB disk ready.\n");
+    printf("  FAT12: 512 sectors, 502 data clusters available\n");
 }
 
 void msc_disk_init(void) {
@@ -173,12 +185,57 @@ int msc_disk_list_jpegs(ImageEntry* out_entries, int max_entries) {
     return count;
 }
 
+// Helper: Read FAT12 entry for a cluster
+static uint16_t get_fat12_entry(uint16_t cluster) {
+    if (cluster < 2) return 0xFFF;  // Reserved
+    
+    const uint8_t* fat1 = flash_storage + (1 * 512);  // FAT1 at LBA 1
+    uint32_t fat_byte_offset = (cluster * 3) / 2;
+    
+    if (cluster & 1) {
+        // Odd cluster
+        return ((fat1[fat_byte_offset] >> 4) & 0x0F) | 
+               (fat1[fat_byte_offset + 1] << 4);
+    } else {
+        // Even cluster
+        return fat1[fat_byte_offset] | 
+               ((fat1[fat_byte_offset + 1] & 0x0F) << 8);
+    }
+}
+
+// Check if file clusters are contiguous (for files spanning multiple clusters)
+static bool clusters_contiguous(uint16_t start_cluster, uint32_t file_size) {
+    uint32_t clusters_needed = (file_size + 511) / 512;
+    if (clusters_needed <= 1) return true;
+    
+    uint16_t cluster = start_cluster;
+    for (uint32_t i = 1; i < clusters_needed; i++) {
+        uint16_t next = get_fat12_entry(cluster);
+        if (next != cluster + 1) {
+            // Not contiguous or end of chain
+            return false;
+        }
+        cluster = next;
+    }
+    return true;
+}
+
 const uint8_t* msc_disk_get_jpeg_by_index(int index, uint32_t* size_out) {
     ImageEntry entries[16];
     int n = msc_disk_list_jpegs(entries, 16);
     if (index < 0 || index >= n) return NULL;
+    
     uint16_t cluster = entries[index].cluster;
-    if (size_out) *size_out = entries[index].size;
+    uint32_t file_size = entries[index].size;
+    
+    if (size_out) *size_out = file_size;
+    
+    // Check if file is contiguous - if not, we can't return a simple pointer
+    if (!clusters_contiguous(cluster, file_size)) {
+        printf("Warning: File '%s' has fragmented clusters, may not load correctly\n", 
+               entries[index].name);
+    }
+    
     uint32_t sector = 10 + (cluster - 2);
     return flash_storage + (sector * DISK_BLOCK_SIZE);
 }
@@ -210,49 +267,134 @@ const uint8_t* msc_disk_find_file(const char* name, uint32_t* size_out) {
     return NULL;
 }
 
-// Create a simple file with given name and data in the last 4KB sector if missing.
+// Helper: Set FAT12 entry for a cluster in both FAT1 and FAT2
+// FAT12 entries are 12 bits packed: cluster N at offset (N*3/2)
+// Even cluster: low byte + low nibble of next byte
+// Odd cluster: high nibble of byte + next byte
+static void set_fat12_entry(uint16_t cluster, uint16_t value) {
+    if (cluster < 2) return;  // Clusters 0,1 are reserved
+    
+    // FAT1 starts at LBA 1 (byte offset 512)
+    // FAT2 starts at LBA 5 (byte offset 2560)
+    uint32_t fat1_offset = 1 * 512;
+    uint32_t fat2_offset = 5 * 512;
+    
+    // FAT12 byte offset for this cluster
+    uint32_t fat_byte_offset = (cluster * 3) / 2;
+    
+    // Read the 4KB sector containing FAT1 and FAT2 (sector 0)
+    memcpy(sector_buf, flash_storage, FLASH_SECTOR_SIZE);
+    
+    // Update FAT1
+    uint8_t* fat1 = sector_buf + fat1_offset + fat_byte_offset;
+    if (cluster & 1) {
+        // Odd cluster: high nibble of byte[0], all of byte[1]
+        fat1[0] = (fat1[0] & 0x0F) | ((value & 0x0F) << 4);
+        fat1[1] = (value >> 4) & 0xFF;
+    } else {
+        // Even cluster: all of byte[0], low nibble of byte[1]
+        fat1[0] = value & 0xFF;
+        fat1[1] = (fat1[1] & 0xF0) | ((value >> 8) & 0x0F);
+    }
+    
+    // Update FAT2 (same structure, different offset)
+    uint8_t* fat2 = sector_buf + fat2_offset + fat_byte_offset;
+    if (cluster & 1) {
+        fat2[0] = (fat2[0] & 0x0F) | ((value & 0x0F) << 4);
+        fat2[1] = (value >> 4) & 0xFF;
+    } else {
+        fat2[0] = value & 0xFF;
+        fat2[1] = (fat2[1] & 0xF0) | ((value >> 8) & 0x0F);
+    }
+    
+    // Write back the FAT sector
+    flush_sector(0);
+}
+
+// Helper: Find first free cluster (FAT entry == 0x000)
+static uint16_t find_free_cluster(void) {
+    const uint8_t* fat1 = flash_storage + (1 * 512);  // FAT1 at LBA 1
+    
+    // Scan clusters 2 to 503 (502 data clusters available)
+    for (uint16_t cluster = 2; cluster < 504; cluster++) {
+        uint32_t fat_byte_offset = (cluster * 3) / 2;
+        uint16_t entry;
+        
+        if (cluster & 1) {
+            // Odd cluster
+            entry = ((fat1[fat_byte_offset] >> 4) & 0x0F) | 
+                    (fat1[fat_byte_offset + 1] << 4);
+        } else {
+            // Even cluster
+            entry = fat1[fat_byte_offset] | 
+                    ((fat1[fat_byte_offset + 1] & 0x0F) << 8);
+        }
+        
+        if (entry == 0x000) {
+            return cluster;  // Free cluster found
+        }
+    }
+    return 0;  // No free cluster
+}
+
+// Create a simple file with given name and data if missing.
+// Properly updates FAT12 to mark cluster as end-of-chain (0xFFF).
 bool msc_disk_create_file_if_missing(const char* name, const uint8_t* data, uint32_t len) {
     // Return if exists
     uint32_t existing_size;
     if (msc_disk_find_file(name, &existing_size)) return true;
 
+    // Limit file size to one cluster (512 bytes) for simplicity
+    if (len > 512) {
+        printf("File too large for simple creation: %lu > 512\n", len);
+        return false;
+    }
+
+    // Find a free cluster
+    uint16_t cluster = find_free_cluster();
+    if (cluster == 0) {
+        printf("No free cluster available\n");
+        return false;
+    }
+
+    // Mark cluster as end-of-chain in FAT (0xFFF)
+    set_fat12_entry(cluster, 0xFFF);
+
     // Find a free root entry in the root sector (LBA 9)
     uint32_t root_lba = 9;
-    uint32_t flash_sector_index = (root_lba * DISK_BLOCK_SIZE) / FLASH_SECTOR_SIZE; // should be 1
+    uint32_t flash_sector_index = (root_lba * DISK_BLOCK_SIZE) / FLASH_SECTOR_SIZE;  // = 1
     uint32_t flash_sector_offset = flash_sector_index * FLASH_SECTOR_SIZE;
 
     // Copy sector into sector_buf
     memcpy(sector_buf, flash_storage + flash_sector_offset, FLASH_SECTOR_SIZE);
 
-    uint8_t* root = sector_buf + ((root_lba - flash_sector_index * (FLASH_SECTOR_SIZE / DISK_BLOCK_SIZE)) * DISK_BLOCK_SIZE);
+    // Root directory is at offset 512 within this 4KB sector (LBA 9 = sector 1 of flash sector 1)
+    uint8_t* root = sector_buf + ((root_lba % 8) * DISK_BLOCK_SIZE);  // LBA 9 % 8 = 1, offset 512
     int free_idx = -1;
     for (int i = 0; i < 16; i++) {
         uint8_t* entry = root + (i * 32);
         if (entry[0] == 0x00 || entry[0] == 0xE5) { free_idx = i; break; }
     }
-    if (free_idx < 0) return false;
+    if (free_idx < 0) {
+        printf("No free directory entry\n");
+        return false;
+    }
 
     // Prepare filename in 8.3 format (uppercase, padded)
     char upname[12];
-    int p = 0;
-    // Split input name at dot
     const char* dot = strchr(name, '.');
-    int namelen = dot ? (dot - name) : strlen(name);
-    int extlen = dot ? (int)strlen(dot+1) : 0;
-    memset(upname, ' ', sizeof(upname));
+    int namelen = dot ? (int)(dot - name) : (int)strlen(name);
+    int extlen = dot ? (int)strlen(dot + 1) : 0;
+    memset(upname, ' ', 11);
     for (int i = 0; i < namelen && i < 8; i++) upname[i] = toupper((unsigned char)name[i]);
     for (int i = 0; i < extlen && i < 3; i++) upname[8 + i] = toupper((unsigned char)dot[1 + i]);
 
     // Prepare directory entry
     uint8_t* entry = root + (free_idx * 32);
     memcpy(entry, upname, 11);
-    entry[11] = 0x20; // archive
-
-    // Choose last available data sector: use last flash sector
-    int last_flash_sector = (DISK_BLOCK_NUM * DISK_BLOCK_SIZE) / FLASH_SECTOR_SIZE - 1; // 63
-    uint32_t data_lba = last_flash_sector * (FLASH_SECTOR_SIZE / DISK_BLOCK_SIZE);
-    // data_lba now is starting LBA for that flash sector (e.g., 504)
-    uint16_t cluster = 2 + (data_lba - 10);
+    entry[11] = 0x20;  // Archive attribute
+    // Clear reserved/time fields
+    memset(entry + 12, 0, 14);
     entry[26] = cluster & 0xFF;
     entry[27] = (cluster >> 8) & 0xFF;
     entry[28] = (len & 0xFF);
@@ -260,23 +402,27 @@ bool msc_disk_create_file_if_missing(const char* name, const uint8_t* data, uint
     entry[30] = (len >> 16) & 0xFF;
     entry[31] = (len >> 24) & 0xFF;
 
-    // Write data to the chosen flash sector
-    uint32_t data_flash_offset = last_flash_sector * FLASH_SECTOR_SIZE;
-    uint8_t data_sector[FLASH_SECTOR_SIZE];
-    // Fill with 0xFF
-    memset(data_sector, 0xFF, FLASH_SECTOR_SIZE);
-    if (len > FLASH_SECTOR_SIZE) return false; // too big
-    memcpy(data_sector, data, len);
-
-    // Program data sector
-    uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(FLASH_STORAGE_OFFSET + data_flash_offset, FLASH_SECTOR_SIZE);
-    flash_range_program(FLASH_STORAGE_OFFSET + data_flash_offset, data_sector, FLASH_SECTOR_SIZE);
-    restore_interrupts(ints);
-
-    // Program root sector back
+    // Write root directory sector back
     flush_sector(flash_sector_offset);
 
+    // Write file data to the cluster
+    // Data area: cluster 2 starts at LBA 10
+    uint32_t data_lba = 10 + (cluster - 2);
+    uint32_t data_flash_sector = (data_lba * DISK_BLOCK_SIZE) / FLASH_SECTOR_SIZE;
+    uint32_t data_flash_offset = data_flash_sector * FLASH_SECTOR_SIZE;
+    uint32_t data_sector_offset = (data_lba * DISK_BLOCK_SIZE) % FLASH_SECTOR_SIZE;
+
+    // Read the 4KB flash sector containing this cluster
+    memcpy(sector_buf, flash_storage + data_flash_offset, FLASH_SECTOR_SIZE);
+    
+    // Clear and write file data
+    memset(sector_buf + data_sector_offset, 0, 512);
+    memcpy(sector_buf + data_sector_offset, data, len);
+    
+    // Write back
+    flush_sector(data_flash_offset);
+
+    printf("Created file '%s' in cluster %u\n", name, cluster);
     return true;
 }
 
@@ -296,22 +442,36 @@ bool msc_disk_overwrite_file(const char* name, const uint8_t* data, uint32_t len
         }
     }
     if (found < 0) return false;
-    if (len > FLASH_SECTOR_SIZE) return false;
+    if (len > 512) return false;  // Single cluster limit
+    if (cluster < 2) return false;
 
-    // Calculate flash sector offset to write
-    uint32_t sector = 10 + (cluster - 2);
-    uint32_t flash_sector_index = (sector * DISK_BLOCK_SIZE) / FLASH_SECTOR_SIZE;
+    // Calculate data location
+    uint32_t data_lba = 10 + (cluster - 2);
+    uint32_t flash_sector_index = (data_lba * DISK_BLOCK_SIZE) / FLASH_SECTOR_SIZE;
     uint32_t flash_sector_offset = flash_sector_index * FLASH_SECTOR_SIZE;
+    uint32_t sector_internal_offset = (data_lba * DISK_BLOCK_SIZE) % FLASH_SECTOR_SIZE;
 
-    // Prepare data sector buffer
-    uint8_t data_sector[FLASH_SECTOR_SIZE];
-    memset(data_sector, 0xFF, FLASH_SECTOR_SIZE);
-    memcpy(data_sector, data, len);
+    // Read the entire 4KB flash sector, modify only our 512-byte cluster
+    memcpy(sector_buf, flash_storage + flash_sector_offset, FLASH_SECTOR_SIZE);
+    memset(sector_buf + sector_internal_offset, 0, 512);  // Clear cluster
+    memcpy(sector_buf + sector_internal_offset, data, len);
 
-    uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(FLASH_STORAGE_OFFSET + flash_sector_offset, FLASH_SECTOR_SIZE);
-    flash_range_program(FLASH_STORAGE_OFFSET + flash_sector_offset, data_sector, FLASH_SECTOR_SIZE);
-    restore_interrupts(ints);
+    // Write back the entire flash sector
+    flush_sector(flash_sector_offset);
+
+    // Update file size in directory entry if changed
+    uint32_t root_flash_sector = (9 * DISK_BLOCK_SIZE) / FLASH_SECTOR_SIZE;  // = 1
+    uint32_t root_flash_offset = root_flash_sector * FLASH_SECTOR_SIZE;
+    memcpy(sector_buf, flash_storage + root_flash_offset, FLASH_SECTOR_SIZE);
+    
+    uint8_t* root = sector_buf + ((9 % 8) * DISK_BLOCK_SIZE);  // LBA 9 offset in sector
+    uint8_t* entry = root + (found * 32);
+    entry[28] = (len & 0xFF);
+    entry[29] = (len >> 8) & 0xFF;
+    entry[30] = (len >> 16) & 0xFF;
+    entry[31] = (len >> 24) & 0xFF;
+    
+    flush_sector(root_flash_offset);
 
     return true;
 }

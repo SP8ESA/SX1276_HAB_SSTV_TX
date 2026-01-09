@@ -487,6 +487,10 @@ static gps_data_t gps_data = {0};
 static char nmea_buffer[128];
 static uint8_t nmea_idx = 0;
 static bool gps_initialized = false;
+// GPS failure tracking: if NMEA has no fix for N consecutive Horus packets,
+// reset GPS by toggling the GPS GND-control pins high for 1s (GPS off) then low (GPS on).
+static int gps_no_fix_consecutive = 0;
+static bool gps_ever_had_fix = false; // do not auto-reset immediately after power-up
 
 // Initialize GPS power control pins and UART
 static void gps_init(void) {
@@ -1936,6 +1940,32 @@ int main(void) {
                     gps_process();
                     
                     send_horus_telemetry();
+                    
+                    // After sending, check GPS fix state and track consecutive failures.
+                    // We call gps_process() again to ensure recent bytes are read.
+                    gps_process();
+                    gps_data_t g;
+                    gps_get_data(&g);
+                    if (g.valid) {
+                        gps_ever_had_fix = true;
+                        gps_no_fix_consecutive = 0;
+                    } else {
+                        // no fix for this packet
+                        gps_no_fix_consecutive++;
+                        // If we previously had a fix but now lost it for N packets, reset GPS
+                        if (gps_ever_had_fix && gps_no_fix_consecutive >= 5) {
+                            printf("GPS lost fix for %d Horus packets - performing GPS reset\n", gps_no_fix_consecutive);
+                            // Toggle GPS power pins: set HIGH (GPS OFF) for 1s, then LOW (GPS ON)
+                            gps_power_off();
+                            sleep_ms(1000);
+                            gps_power_on();
+                            // After reset, zero Horus packet counter and restart fix tracking
+                            horus_packet_count = 0;
+                            gps_no_fix_consecutive = 0;
+                            gps_ever_had_fix = false;
+                            // Allow GPS to restart; next cycles should wait for new fix
+                        }
+                    }
                     
                     // Small delay between packets
                     if (h + 1 < horus_tx_count) {
