@@ -1,22 +1,25 @@
 # RA-02 SSTV Balloon Transmitter
 
-Stratospheric balloon SSTV image transmitter using SX1276 (RA-02) module + Raspberry Pi Pico.
+Stratospheric balloon SSTV image transmitter with Horus v2 telemetry using SX1276 (RA-02) module + Raspberry Pi Pico.
 
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
 
 ## Project Description
 
-SSTV (Slow Scan Television) image transmitter for stratospheric balloon missions, designed for 2m (144 MHz) and 70cm (430 MHz) amateur radio bands.
+SSTV (Slow Scan Television) image transmitter with integrated Horus Binary v2 4FSK telemetry for stratospheric balloon missions. Designed for 70cm (430 MHz) amateur radio band.
 
 ### Features
 
 - **USB Mass Storage** - Pico appears as USB drive for easy image upload
-- **JPEG Support** - Automatic JPEG decoding
+- **JPEG Support** - Automatic JPEG decoding with scaling
 - **Multiple Images** - Cycles through all JPEG files alphabetically
 - **Two SSTV Modes** - Robot36 (36s) and PD120 (126s)
-- **Horus v2 Telemetry** - 4FSK telemetry between SSTV images
+- **Horus v2 Telemetry** - TRUE 4FSK telemetry (real RF frequency shifting)
+- **GPS Integration** - ATGM336H GPS module support
+- **Image Overlay** - Callsign, label, and image counter on transmitted images
 - **Configuration File** - Easy setup via config.txt
 - **PPM Correction** - Precise frequency tuning for crystal offset
+- **Separate Frequencies** - Independent SSTV and Horus frequencies
 - **Auto-recovery** - GP5 jumper for factory reset
 
 ## Author
@@ -33,16 +36,16 @@ Code generated with assistance from Claude Opus 4.5
 |-----------|-------------|
 | Raspberry Pi Pico | RP2040 microcontroller |
 | RA-02 (SX1276) | 433 MHz LoRa module |
-| Wire Antenna | 1/4 wave for 2m or 70cm band |
+| ATGM336H | GPS module (optional but recommended) |
+| Wire Antenna | 1/4 wave for 70cm band (~17cm) |
 
-### Frequency Bands
+### Frequency Band
 
 | Band | Frequency Range |
 |------|-----------------|
-| 2m | 144.000 - 146.000 MHz |
 | 70cm | 430.000 - 440.000 MHz |
 
-**Note:** RA-02 module is designed for 433 MHz. For 2m band operation, different module may be required (e.g., SX1278 for 137-525 MHz).
+**Note:** RA-02 module is designed for 433 MHz band.
 
 ## Wiring Diagram
 
@@ -59,6 +62,12 @@ GPIO 14            ────────── RESET
 GPIO 15            ────────── DIO0
 
 3V3 (Pin 36)       ────────── VCC (3.3V!)
+GND                ────────── GND
+
+Raspberry Pi Pico              ATGM336H GPS Module
+=================              ===================
+GPIO 1 (UART0 RX)  ────────── TX
+3V3                ────────── VCC
 GND                ────────── GND
 
 GPIO 5             ────────── GND (jumper for factory reset)
@@ -118,43 +127,68 @@ cp SX1276_HAB_SSTV_TX.uf2 /media/$USER/RPI-RP2/
 Edit `config.txt` on the USB drive:
 
 ```
-freq=434.500
+sstv_freq=433.400
+horus_freq=437.600
 ppm=0.0
 interval=3
 mode=robot36
-horus=0
+horus=1
 horus_id=256
 horus_count=1
+sstv_callsign=N0CALL
+sstv_label=
+sstv_font_size=2
+sstv_counter=1
 ```
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `freq` | TX frequency in MHz | 434.500 |
+| `sstv_freq` | SSTV TX frequency in MHz | 433.400 |
+| `horus_freq` | Horus TX frequency in MHz | 437.600 |
 | `ppm` | Crystal PPM correction | 0.0 |
 | `interval` | Seconds between transmissions | 3 |
 | `mode` | SSTV mode: `robot36` or `pd120` | robot36 |
-| `horus` | Enable Horus v2 telemetry: `0` or `1` | 0 |
+| `horus` | Enable Horus v2 telemetry: `0` or `1` | 1 |
 | `horus_id` | Horus payload ID (256-65535 for custom) | 256 |
 | `horus_count` | Number of Horus packets per SSTV cycle | 1 |
+| `sstv_callsign` | Callsign overlay (top-left corner) | N0CALL |
+| `sstv_label` | Label overlay (bottom-left corner) | (empty) |
+| `sstv_font_size` | Font size for overlays (1-4) | 2 |
+| `sstv_counter` | Show image counter (1/12, 2/12...): `0` or `1` | 1 |
+
+### Image Overlay
+
+The transmitter automatically overlays text on images before transmission:
+
+- **Top-left:** Callsign (from `sstv_callsign`)
+- **Top-right:** Image counter (e.g., "3/12") if `sstv_counter=1` and multiple images
+- **Bottom-left:** Custom label (from `sstv_label`)
+
+Font size can be adjusted with `sstv_font_size` (1=small, 4=large).
 
 ### Horus Binary v2 Telemetry
 
-The transmitter supports **Horus Binary v2** 4FSK telemetry. When enabled, telemetry packets are transmitted before each SSTV image.
+The transmitter supports **Horus Binary v2** TRUE 4FSK telemetry. When enabled, telemetry packets are transmitted before each SSTV image on a separate frequency.
 
 **Horus v2 Specifications:**
-- 100 baud 4FSK
+- 100 baud TRUE 4FSK (real RF frequency shifting, not AFSK)
+- 270 Hz tone spacing
 - Golay FEC for error correction
-- Standard Horus audio frequencies (1200-2010 Hz)
+- +1200 Hz audio offset for USB reception
 - Compatible with [Horus-GUI](https://github.com/projecthorus/horus-gui) decoder
+
+**USB Reception:**
+Tune your SDR to the `horus_freq` and use USB mode. The lowest tone will be at +1200 Hz audio, highest at +2010 Hz. This allows direct reception with standard Horus-GUI settings.
 
 **Packet Contents:**
 - Payload ID and packet counter
-- Time (hours, minutes, seconds)
-- Position (latitude, longitude, altitude)
+- Time (hours, minutes, seconds) from GPS
+- Position (latitude, longitude, altitude) from GPS
 - Speed and satellite count
-- Temperature and battery voltage
+- Core temperature and battery voltage (ADC)
 
-**Note:** Currently sends simulated test data. To use real GPS/sensor data, modify the `horus_update_telemetry()` function with actual readings.
+**GPS Integration:**
+Connect ATGM336H GPS module to GPIO1 (UART0 RX) for real position data. Without GPS, simulated test coordinates are transmitted.
 
 ### SSTV Modes
 
@@ -199,18 +233,22 @@ ffmpeg -i input.jpg -pix_fmt yuvj420p output.jpg
 
 | Parameter | Value |
 |-----------|-------|
-| Modulation | FM (AFSK for SSTV) |
-| Output power | +14 dBm (25 mW) typical |
+| SSTV Modulation | FM (1200-2300 Hz audio) |
+| Horus Modulation | TRUE 4FSK (270 Hz spacing) |
+| Output power | +20 dBm (100 mW) max |
 | Frequency accuracy | Depends on crystal + PPM correction |
 | Image buffer | 320×240 YCbCr |
 | Flash storage | 256 KB for images |
+| GPS | ATGM336H via UART0 (9600 baud) |
 
 ## Balloon Mission Notes
 
 - Use Robot36 for faster updates, PD120 for better quality
+- Enable Horus telemetry for real-time position tracking
 - Test PPM correction on ground before launch
 - Ensure antenna is properly matched for chosen frequency
 - Consider duty cycle and thermal management at altitude
+- GPS may need clear sky view for lock
 
 ## Warning
 
